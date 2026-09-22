@@ -89,3 +89,32 @@ def test_kv_cache_latch():
     model2, _, reason2 = select_model_and_effort(huge_payload, session_id)
     assert model2 == model1
     assert "KV-Cache Latch locked" in reason2
+
+def test_feedback_and_memory_escalation():
+    # Submit feedback about a failed prompt that was misclassified as Tier 0
+    feedback_payload = {
+        "prompt": "Parse complex AST and lint TCPA regex rules",
+        "failed_tier": 0,
+        "escalated_tier": 3,
+        "error": "Failed to handle AST node nesting"
+    }
+    resp = client.post("/v1/feedback", json=feedback_payload)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "recorded"
+    assert data["incident_id"] > 0
+
+    # Querying a very similar prompt should now auto-escalate via memory
+    similar_messages = [{"role": "user", "content": "Parse complex AST and lint TCPA regex"}]
+    tier, reason = classify_request(similar_messages)
+    assert tier == 3
+    assert "Memory Auto-Escalation" in reason
+
+def test_stats_endpoint():
+    resp = client.get("/v1/stats")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "total_incidents" in data
+    assert "metrics" in data
+    assert "recent_incidents" in data
+

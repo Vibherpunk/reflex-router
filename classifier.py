@@ -3,7 +3,8 @@ Contextual System 1 Classifier (<10ms execution).
 Evaluates prompts and previous conversation turns to assign compute tiers.
 """
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
+from memory import check_memory, record_incident
 
 # Regex triggers for explicit and semantic overrides
 TIER3_PATTERNS = [
@@ -59,9 +60,33 @@ def classify_request(messages: List[Dict[str, Any]]) -> Tuple[int, str]:
 
     # 1. Trojan Horse Check: Did the previous command or test fail?
     if detect_tool_errors(messages):
+        # Autonomously record incident into System 1 memory
+        if last_user_content:
+            try:
+                record_incident(
+                    prompt=last_user_content,
+                    failed_tier=0,
+                    escalated_tier=2,
+                    error_signature="Compiler/test error in preceding tool outputs"
+                )
+            except Exception:
+                pass
         return 2, "Escalated to Tier 2: Detected test/compiler error in prior execution"
 
-    # 2. Check Tier 3 triggers (Frontier Architecture)
+    # 2. System 1 Memory Check: Has a similar prompt or operational nuance failed before?
+    if last_user_content:
+        try:
+            mem_hit = check_memory(last_user_content, threshold=0.55)
+            if mem_hit:
+                esc_tier = mem_hit["escalated_tier"]
+                inc_id = mem_hit["incident_id"]
+                sim = mem_hit["similarity"]
+                sample_snippet = mem_hit["sample"][:35]
+                return esc_tier, f"Memory Auto-Escalation (Incident #{inc_id}, sim={sim}): learned from prior failure in '{sample_snippet}'"
+        except Exception:
+            pass
+
+    # 3. Check Tier 3 triggers (Frontier Architecture)
     for pattern in TIER3_PATTERNS:
         if re.search(pattern, last_user_content):
             return 3, f"Matched Tier 3 pattern: {pattern}"

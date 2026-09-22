@@ -8,7 +8,7 @@ import json
 import time
 import asyncio
 import hashlib
-from typing import Dict, Any, AsyncGenerator
+from typing import Dict, Any, AsyncGenerator, Tuple, Optional
 
 import httpx
 from fastapi import FastAPI, Request, Response, HTTPException
@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from config import CONFIG
 from classifier import classify_request
+from memory import record_incident, get_stats, log_request
 
 app = FastAPI(title="OpenCode-Go System 1 Router Gateway", version="1.0.0")
 
@@ -82,6 +83,33 @@ async def list_models():
     for tier_id, info in CONFIG["model_tiers"].items():
         models_list.append({"id": info["primary"], "object": "model", "owned_by": "opencode-go"})
     return {"object": "list", "data": models_list}
+
+@app.post("/v1/feedback")
+async def submit_feedback(request: Request):
+    """
+    Submits user or agent execution feedback.
+    Skidnir-style System 1 recursive learning records the failure and escalates future similar turns.
+    """
+    data = await request.json()
+    prompt = str(data.get("prompt", "")).strip()
+    failed_tier = int(data.get("failed_tier", 0))
+    escalated_tier = int(data.get("escalated_tier", 2))
+    error = str(data.get("error", "Manual or automated feedback override"))
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt is required for feedback learning")
+
+    inc_id = record_incident(
+        prompt=prompt,
+        failed_tier=failed_tier,
+        escalated_tier=escalated_tier,
+        error_signature=error
+    )
+    return {"status": "recorded", "incident_id": inc_id, "escalated_tier": escalated_tier}
+
+@app.get("/v1/stats")
+async def get_router_stats():
+    """Returns memory metrics, request counts, and recent incident logs."""
+    return get_stats()
 
 async def stream_with_heartbeat(
     client: httpx.AsyncClient,
@@ -186,6 +214,10 @@ async def chat_completions(request: Request):
             tier_num = tid
             break
     fallback_model = CONFIG["model_tiers"][tier_num]["fallback"]
+    try:
+        log_request(tier_num)
+    except Exception:
+        pass
 
     # Rewrite model
     payload["model"] = model
