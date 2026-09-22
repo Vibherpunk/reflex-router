@@ -95,6 +95,21 @@ Reflex's streaming engine injects synthetic `: ping\n\n` SSE comment frames ever
 ### F. Sticky-Session KV-Cache Latching
 When a multi-turn conversation exceeds 20,000 tokens, Reflex locks the model family to preserve provider-side KV prompt caching, avoiding the 10x cost penalty of cache thrashing.
 
+### G. CLI Harness Federation (Process-Level Subagent Arbitrage)
+When an agent in one harness (e.g. Claude Code) needs a subagent specialized in another model (e.g. Gemini Ultra or DeepSeek-V4), Reflex eliminates the need for reverse-engineered web session cookies or separate paid API keys.
+
+Reflex auto-discovers and delegates directly to the native CLIs installed on your Mac:
+* **`claude` (Claude Code):** Uses your native Claude Pro/Teams subscription.
+* **`agy` (Antigravity):** Uses your native Google Gemini Ultra/Advanced subscription.
+* **`opencode` (OpenCode):** Uses your flat OpenCode-Go subscription.
+* **`goose` (Goose):** Uses your local Goose agent profiles.
+* **`codex` (Codex CLI):** Uses your native OpenAI subscription.
+
+#### Defensive Protections in Federation:
+1. **Headless Execution Matrix:** Enforces strict non-interactive flags (`--dangerously-skip-permissions`, `--auto`, `--no-session`, `TERM=dumb`) so child processes never freeze waiting for human TTY approvals.
+2. **Process Group Containment (`os.setsid`):** Spawns child harnesses in detached process groups and terminates all descendants with `os.killpg` on timeout, preventing zombie compiler tasks.
+3. **Recursion Limit & Cycle Guard:** Enforces max depth of 2 hops (`REFLEX_DELEGATION_DEPTH <= 2`) and prevents ping-pong loops (`A -> B -> A`) via execution chain tracking.
+
 ---
 
 ## 3. Verified Compute Tiers
@@ -108,15 +123,26 @@ When a multi-turn conversation exceeds 20,000 tokens, Reflex locks the model fam
 
 ---
 
-## 4. API Endpoints
+## 4. API & CLI Endpoints
 
 | Endpoint | Method | Description |
 | :--- | :---: | :--- |
-| `/health` | `GET` | Reports provider configuration status, API key health, and circuit breakers. |
+| `/health` | `GET` | Reports provider status, API key health, and circuit breakers. |
 | `/v1/models` | `GET` | OpenAI-compatible model listing (`reflex/auto` + catalog). |
 | `/v1/chat/completions` | `POST` | Core OpenAI-compatible streaming & non-streaming completions endpoint. |
 | `/v1/feedback` | `POST` | Ingests execution feedback to train Skidnir System 1 incident memory. |
 | `/v1/stats` | `GET` | Returns incident counts, tier request distributions, and circuit breaker states. |
+| `/v1/harnesses` | `GET` | Auto-discovers all installed & authenticated CLI agent harnesses on host. |
+| `/v1/delegate` | `POST` | Spawns a subagent in an installed CLI harness (e.g. `agy`, `claude`, `opencode`). |
+
+### CLI Tools
+```bash
+# Scan installed agent harnesses and subscriptions
+./reflex.py scan
+
+# Delegate a subagent task to an auto-matched harness
+./reflex.py delegate "Refactor authentication flow in auth.py" --model claude
+```
 
 ---
 

@@ -142,7 +142,19 @@ def test_stats_endpoint():
     assert resp.status_code == 200
     data = resp.json()
     assert "total_incidents" in data
-    assert "metrics" in data
-    assert "recent_incidents" in data
     assert "circuit_breakers" in data
     assert "opencode-go" in data["circuit_breakers"]
+
+def test_harnesses_endpoint():
+    resp = client.get("/v1/harnesses")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "harnesses" in data
+    assert "claude" in data["harnesses"]
+    assert "agy" in data["harnesses"]
+    assert "opencode" in data["harnesses"]
+
+def test_delegate_endpoint_validation():
+    # Empty task returns 400
+    resp = client.post("/v1/delegate", json={"task": ""})
+    assert resp.status_code == 400

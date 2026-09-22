@@ -20,6 +20,7 @@ from config import CONFIG
 from classifier import classify_request
 from memory import record_incident, get_stats, log_request
 from circuit_breaker import ProviderCircuitBreaker, BreakerState
+from federation import discover_harnesses, delegate_subagent
 
 logger = logging.getLogger("reflex.server")
 logging.basicConfig(level=logging.INFO)
@@ -192,6 +193,36 @@ async def get_router_stats():
     stats = get_stats()
     stats["circuit_breakers"] = {name: b.get_status() for name, b in BREAKER_REGISTRY.items()}
     return stats
+
+@app.get("/v1/harnesses")
+async def get_harnesses(rescan: bool = False):
+    """Returns all auto-discovered local CLI agent harnesses on this machine."""
+    return discover_harnesses(force_rescan=rescan)
+
+@app.post("/v1/delegate")
+async def handle_delegation(request: Request):
+    """
+    CLI Harness Federation: Delegates a subagent task to an installed CLI agent harness.
+    Enforces non-interactive execution, process group isolation, and recursion depth limits.
+    """
+    data = await request.json()
+    task = str(data.get("task", "")).strip()
+    if not task:
+        raise HTTPException(status_code=400, detail="Task prompt is required")
+
+    preferred_model = data.get("preferred_model", "auto")
+    preferred_harness = data.get("preferred_harness")
+    cwd = data.get("cwd")
+    timeout = float(data.get("timeout_sec", 120.0))
+
+    result = await delegate_subagent(
+        task=task,
+        preferred_model=preferred_model,
+        preferred_harness=preferred_harness,
+        cwd=cwd,
+        timeout_sec=timeout
+    )
+    return result
 
 async def preflight_and_stream(
     sub_route: Dict[str, Any],
