@@ -86,7 +86,9 @@ HARNESS_SPECS = {
             bin_path,
             "run",
             "-t", task,
-            "--no-session"
+            "--no-session",
+            "--output-format", "json",
+            "-q"
         ]
     },
     "codex": {

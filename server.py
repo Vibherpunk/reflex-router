@@ -1,7 +1,7 @@
 """
-Reflex Multi-Provider Subscription-First Gateway (v2.0.0).
-Implements Zero-Byte Speculative Pre-Flight Failover, 3-State Canary Circuit Breaker,
-SSE Heartbeat Generator, Skidnir Recursive Incident Memory, and KV-Cache Preservation.
+Reflex Multi-Provider Subscription-First Gateway (v2.1.0).
+Integrated with Zero-Byte Speculative Pre-Flight, 3-State Canary Circuit Breaker,
+Contextual Prompt Classifier, SQLite Incident Memory, and CLI Harness Federation.
 """
 import os
 import json
@@ -56,8 +56,8 @@ async def lifespan(app: FastAPI):
     logger.info("Reflex Gateway HTTP connection pool safely closed.")
 
 app = FastAPI(
-    title="Reflex Multi-Provider Intelligent Gateway",
-    version="2.0.0",
+    title="Reflex System 1 Router",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -154,7 +154,7 @@ async def health_check():
     return {
         "status": "active",
         "service": "Reflex Multi-Provider Intelligent Gateway",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "providers": providers_summary,
         "tiers": CONFIG["model_tiers"]
     }
