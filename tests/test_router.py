@@ -1,12 +1,12 @@
 """
-Unit and integration test suite for OpenCode-Go System 1 Router.
+Unit and integration test suite for Reflex Multi-Provider System 1 Router.
 """
 import pytest
 from fastapi.testclient import TestClient
 
 from config import CONFIG
 from classifier import classify_request, detect_tool_errors
-from server import app, estimate_tokens, get_session_id, select_model_and_effort
+from server import app, estimate_tokens, get_session_id, select_candidate_routes, normalize_error
 
 client = TestClient(app)
 
@@ -15,7 +15,10 @@ def test_health_endpoint():
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "active"
-    assert data["auth_configured"] is True
+    assert "providers" in data
+    assert "opencode-go" in data["providers"]
+    assert "openrouter" in data["providers"]
+    assert "gemini" in data["providers"]
     assert "tiers" in data
 
 def test_models_endpoint():
@@ -25,7 +28,8 @@ def test_models_endpoint():
     model_ids = [m["id"] for m in data["data"]]
     assert "auto" in model_ids
     assert "deepseek-v4-flash" in model_ids
-    assert "deepseek-v4-pro" in model_ids
+    assert "anthropic/claude-3.7-sonnet" in model_ids
+    assert "gemini-2.0-flash" in model_ids
 
 def test_classifier_tier0_routine():
     messages = [{"role": "user", "content": "Format this list of numbers: 1, 2, 3"}]
@@ -57,7 +61,6 @@ def test_classifier_explicit_override():
     assert tier == 3
 
 def test_trojan_horse_escalation():
-    """Short prompt should escalate to Tier 2 if prior turn has test failure."""
     messages = [
         {"role": "user", "content": "Run tests"},
         {"role": "tool", "content": "FAIL: test_worker.py: AssertionError: Expected 200 but got 500. Exit code 1"},
@@ -68,6 +71,28 @@ def test_trojan_horse_escalation():
     assert tier == 2
     assert "Escalated" in reason
 
+def test_capability_matching_metered_override():
+    """If user requests a model only on metered, route directly to metered."""
+    payload = {
+        "model": "anthropic/claude-3.7-sonnet",
+        "messages": [{"role": "user", "content": "Hello Claude"}]
+    }
+    sub_route, metered_route, tier, reason = select_candidate_routes(payload, "sess-test-metered")
+    assert sub_route["provider"] == "openrouter"
+    assert metered_route["provider"] == "openrouter"
+    assert "Capability match" in reason
+
+def test_subscription_priority_default():
+    """Default auto tier should prioritize subscription ($0 marginal cost)."""
+    payload = {
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Implement auth middleware"}]
+    }
+    sub_route, metered_route, tier, reason = select_candidate_routes(payload, "sess-test-sub")
+    assert sub_route["provider"] == "opencode-go"
+    assert metered_route["provider"] == "openrouter"
+    assert "Tier 1" in reason
+
 def test_session_id_deterministic():
     payload = {"messages": [{"role": "user", "content": "Hello session"}]}
     sess1 = get_session_id(payload, {})
@@ -76,22 +101,25 @@ def test_session_id_deterministic():
     assert sess1.startswith("sess-")
 
 def test_kv_cache_latch():
-    session_id = "test-kv-session-001"
-    
-    # 1. First prompt establishes model
+    session_id = "test-kv-session-002"
     small_payload = {"messages": [{"role": "user", "content": "Refactor this component"}]}
-    model1, _, _ = select_model_and_effort(small_payload, session_id)
-    assert model1 == "qwen3.7-plus"
+    sub1, _, _, _ = select_candidate_routes(small_payload, session_id)
+    assert sub1["model"] == "qwen3.7-plus"
 
-    # 2. Huge prompt (>20,000 tokens) should lock to the established model
     huge_text = "word " * 25000
     huge_payload = {"messages": [{"role": "user", "content": huge_text}]}
-    model2, _, reason2 = select_model_and_effort(huge_payload, session_id)
-    assert model2 == model1
+    sub2, _, _, reason2 = select_candidate_routes(huge_payload, session_id)
+    assert sub2["model"] == sub1["model"]
     assert "KV-Cache Latch locked" in reason2
 
+def test_normalize_error_html_guard():
+    html_body = b"<!DOCTYPE html><html><body>502 Bad Gateway Cloudflare</body></html>"
+    err = normalize_error(502, html_body)
+    assert "error" in err
+    assert err["error"]["code"] == 502
+    assert "Upstream error (HTTP 502)" in err["error"]["message"]
+
 def test_feedback_and_memory_escalation():
-    # Submit feedback about a failed prompt that was misclassified as Tier 0
     feedback_payload = {
         "prompt": "Parse complex AST and lint TCPA regex rules",
         "failed_tier": 0,
@@ -104,7 +132,6 @@ def test_feedback_and_memory_escalation():
     assert data["status"] == "recorded"
     assert data["incident_id"] > 0
 
-    # Querying a very similar prompt should now auto-escalate via memory
     similar_messages = [{"role": "user", "content": "Parse complex AST and lint TCPA regex"}]
     tier, reason = classify_request(similar_messages)
     assert tier == 3
@@ -117,4 +144,5 @@ def test_stats_endpoint():
     assert "total_incidents" in data
     assert "metrics" in data
     assert "recent_incidents" in data
-
+    assert "circuit_breakers" in data
+    assert "opencode-go" in data["circuit_breakers"]
