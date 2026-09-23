@@ -22,17 +22,20 @@ class ProviderCircuitBreaker:
         name: str,
         base_cooldown: float = 30.0,
         max_cooldown: float = 300.0,
-        jitter: float = 5.0
+        jitter: float = 5.0,
+        canary_lease_seconds: float = 60.0
     ):
         self.name = name
         self.base_cooldown = base_cooldown
         self.max_cooldown = max_cooldown
         self.jitter = jitter
+        self.canary_lease_seconds = canary_lease_seconds
 
         self.state = BreakerState.CLOSED
         self.failure_count = 0
         self.cooldown_until = 0.0
         self.canary_in_flight = False
+        self.canary_granted_at = 0.0
         self._lock = asyncio.Lock()
 
     async def can_attempt(self) -> bool:
@@ -49,16 +52,28 @@ class ProviderCircuitBreaker:
                 if now >= self.cooldown_until:
                     self.state = BreakerState.HALF_OPEN
                     self.canary_in_flight = True
+                    self.canary_granted_at = now
                     logger.info(f"[{self.name}] Cooldown expired. Entering HALF_OPEN. Dispatched canary probe.")
                     return True
                 return False
 
             if self.state == BreakerState.HALF_OPEN:
-                # In HALF_OPEN, only allow exactly 1 canary probe in flight
-                if not self.canary_in_flight:
-                    self.canary_in_flight = True
-                    return True
-                return False
+                # In HALF_OPEN, only allow exactly 1 canary probe in flight.
+                if self.canary_in_flight:
+                    # Liveness guard: if the in-flight canary's lease has expired
+                    # (caller timed out, crashed, or never recorded success/failure),
+                    # the slot must be released so the provider is not deadlocked
+                    # out of the circuit forever.
+                    if now - self.canary_granted_at < self.canary_lease_seconds:
+                        return False
+                    logger.warning(
+                        f"[{self.name}] Canary lease expired after "
+                        f"{self.canary_lease_seconds:.0f}s without a recorded outcome. "
+                        "Granting replacement canary probe."
+                    )
+                self.canary_in_flight = True
+                self.canary_granted_at = now
+                return True
 
             return False
 
@@ -70,6 +85,7 @@ class ProviderCircuitBreaker:
             self.state = BreakerState.CLOSED
             self.failure_count = 0
             self.canary_in_flight = False
+            self.canary_granted_at = 0.0
 
     async def record_failure(self, status_code: int, retry_after: Optional[float] = None) -> float:
         """Trips breaker with exponential backoff and randomized jitter."""
@@ -86,6 +102,7 @@ class ProviderCircuitBreaker:
             self.cooldown_until = time.time() + backoff
             self.state = BreakerState.OPEN
             self.canary_in_flight = False
+            self.canary_granted_at = 0.0
             logger.warning(
                 f"[{self.name}] Trip failure (status={status_code}, count={self.failure_count}). "
                 f"Entering OPEN state for {backoff:.2f}s."

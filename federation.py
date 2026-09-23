@@ -277,6 +277,218 @@ def select_harness_for_model(requested_model: str, manifest: Optional[Dict[str, 
 
     return None
 
+CIRCUIT_BREAKER_FILE = HOME / ".reflex/harness_health.json"
+
+HARNESS_FAILOVER_CHAINS = {
+    "claude": ["claude", "opencode", "goose"],
+    "opencode": ["opencode", "goose", "agy"],
+    "agy": ["agy", "opencode", "goose"],
+    "goose": ["goose", "opencode", "claude"],
+    "codex": ["codex", "opencode", "goose"]
+}
+
+def get_circuit_breaker() -> Dict[str, Any]:
+    if CIRCUIT_BREAKER_FILE.exists():
+        try:
+            with open(CIRCUIT_BREAKER_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def is_harness_tripped(harness: str) -> Tuple[bool, Optional[str]]:
+    cb = get_circuit_breaker()
+    entry = cb.get(harness)
+    if not entry:
+        return False, None
+    tripped_at = entry.get("tripped_at", 0)
+    cooldown_sec = entry.get("cooldown_sec", 300)
+    now = time.time()
+    if now < (tripped_at + cooldown_sec):
+        rem = int((tripped_at + cooldown_sec) - now)
+        return True, f"{entry.get('reason', 'rate_limited')} (cooling down, {rem}s remaining)"
+    return False, None
+
+def trip_harness_circuit_breaker(harness: str, reason: str, cooldown_sec: int = 3600):
+    cb = get_circuit_breaker()
+    cb[harness] = {
+        "state": "TRIPPED",
+        "tripped_at": time.time(),
+        "cooldown_sec": cooldown_sec,
+        "reason": reason
+    }
+    CIRCUIT_BREAKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(CIRCUIT_BREAKER_FILE, "w") as f:
+            json.dump(cb, f, indent=2)
+    except Exception:
+        pass
+
+def reset_harness_circuit_breaker(harness: str):
+    cb = get_circuit_breaker()
+    if harness in cb:
+        cb.pop(harness, None)
+        try:
+            with open(CIRCUIT_BREAKER_FILE, "w") as f:
+                json.dump(cb, f, indent=2)
+        except Exception:
+            pass
+
+def classify_harness_error(harness: str, returncode: int, stdout: str, stderr: str) -> Tuple[bool, str, int]:
+    """
+    Determines if an error is an infrastructure/rate-limit/auth failure eligible for failover,
+    versus user code or test execution failure.
+    Returns (is_recoverable: bool, reason: str, cooldown_sec: int).
+    """
+    combined = f"{stderr}\n{stdout}".lower()
+
+    if returncode == 127:
+        return True, "binary_not_found", 86400
+
+    if any(sig in combined for sig in [
+        "429", "rate limit", "weekly limit", "daily limit",
+        "quota exceeded", "resource has been exhausted", "credit balance too low",
+        "rate_limit_error", "out of credits", "insufficient_quota"
+    ]):
+        cooldown = 3600 if "weekly" in combined else 300
+        return True, "rate_limit_exceeded", cooldown
+
+    if any(sig in combined for sig in [
+        "401", "unauthorized", "auth token expired", "authentication failed",
+        "invalid api key", "oauth token expired", "login required"
+    ]):
+        return True, "auth_failure", 3600
+
+    if any(sig in combined for sig in [
+        "connection refused", "network error", "timed out", "econnrefused",
+        "failed to resolve host", "socket hang up"
+    ]):
+        return True, "network_error", 60
+
+    # Guard: if the harness ran code/tests that failed, do NOT treat as infra error
+    if any(sig in combined for sig in ["pytest", "assertionerror", "failed (failures=", "exit status 1", "test failed"]):
+        return False, "test_or_code_failure", 0
+
+    if returncode != 0:
+        return True, f"harness_crash_exit_{returncode}", 120
+
+    return False, "no_error", 0
+
+def get_git_state(cwd: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Takes a lightweight snapshot of git HEAD and status in cwd."""
+    target_dir = cwd or os.getcwd()
+    try:
+        inside = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=target_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0
+        )
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return None
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=target_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0
+        ).stdout.strip()
+        status_raw = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=target_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0
+        ).stdout.strip()
+        status_lines = [line.strip() for line in status_raw.splitlines() if line.strip()]
+        return {"is_git": True, "head": head, "status_lines": status_lines, "cwd": target_dir}
+    except Exception:
+        return None
+
+def rollback_git_state(cwd: Optional[str], baseline: Optional[Dict[str, Any]]) -> bool:
+    """
+    Rolls back only NEW uncommitted modifications/untracked files introduced during the harness run.
+    Safeguards pre-existing dirty files that were already modified before execution.
+    """
+    if not baseline or not baseline.get("is_git"):
+        return False
+    target_dir = baseline.get("cwd") or cwd or os.getcwd()
+    try:
+        curr_res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=target_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0
+        )
+        if curr_res.returncode != 0:
+            return False
+        curr_lines = [line.strip() for line in curr_res.stdout.splitlines() if line.strip()]
+        baseline_lines = set(baseline.get("status_lines", []))
+
+        # Identify newly modified or created items
+        new_entries = [line for line in curr_lines if line not in baseline_lines]
+        if not new_entries:
+            return True
+
+        for entry in new_entries:
+            parts = entry.split(None, 1)
+            if len(parts) < 2:
+                continue
+            status_code, filepath = parts[0], parts[1]
+            full_path = Path(target_dir) / filepath
+            if status_code.startswith("??"):
+                # Untracked file created by failed harness: safely remove
+                if full_path.is_file():
+                    full_path.unlink(missing_ok=True)
+                elif full_path.is_dir():
+                    shutil.rmtree(full_path, ignore_errors=True)
+            else:
+                # Tracked file modified by failed harness: restore to git index/HEAD
+                subprocess.run(
+                    ["git", "checkout", "--", filepath],
+                    cwd=target_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5.0
+                )
+
+        logger.warning(f"Selectively rolled back {len(new_entries)} files introduced by failed harness in {target_dir}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to rollback git state: {e}")
+        return False
+
+async def call_reflex_http_gateway(task: str, preferred_model: str = "auto", timeout_sec: float = 30.0) -> Dict[str, Any]:
+    """Fallback to Reflex HTTP Gateway on 127.0.0.1:8787 using urllib."""
+    import urllib.request
+    import urllib.error
+
+    target = preferred_model.lower()
+    if "claude" in target or "sonnet" in target:
+        remote_model = "anthropic/claude-3.7-sonnet"
+    elif "deepseek" in target or "r1" in target:
+        remote_model = "deepseek/deepseek-r1"
+    else:
+        remote_model = "deepseek/deepseek-chat"
+
+    gateway_url = "http://127.0.0.1:8787/v1/chat/completions"
+    payload = {
+        "model": remote_model,
+        "messages": [{"role": "user", "content": task}],
+        "stream": False
+    }
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(
+            gateway_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            choice = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return {
+                "status": "success",
+                "harness": "reflex_http_gateway",
+                "model": remote_model,
+                "response": choice,
+                "duration_ms": int((time.time() - t0) * 1000)
+            }
+    except Exception as e:
+        return {
+            "status": "failed",
+            "harness": "reflex_http_gateway",
+            "error": str(e),
+            "duration_ms": int((time.time() - t0) * 1000)
+        }
+
 async def delegate_subagent(
     task: str,
     preferred_model: str = "auto",
@@ -285,8 +497,7 @@ async def delegate_subagent(
     timeout_sec: float = 120.0
 ) -> Dict[str, Any]:
     """
-    Main delegation coordinator.
-    Enforces recursion depth, cycle prevention, process isolation, and returns a structured envelope.
+    Main delegation coordinator with automatic failover waterfall and git rollback barrier.
     """
     depth = int(os.environ.get("REFLEX_DELEGATION_DEPTH", "0"))
     chain = os.environ.get("REFLEX_DELEGATION_CHAIN", "")
@@ -298,69 +509,171 @@ async def delegate_subagent(
             "delegation_depth": depth
         }
 
-    manifest = discover_harnesses()
-    installed = manifest.get("harnesses", {})
-
-    # Select harness
-    harness_key = preferred_harness
-    if not harness_key or harness_key not in installed:
-        harness_key = select_harness_for_model(preferred_model, manifest)
-
-    if not harness_key or harness_key not in installed:
-        return {
-            "status": "unsupported",
-            "message": f"No authenticated CLI harness installed for model '{preferred_model}'. Falling back to Reflex HTTP gateway.",
-            "available_harnesses": list(installed.keys())
-        }
-
-    # Cycle Detection
     chain_elements = chain.split(":") if chain else []
-    if harness_key in chain_elements:
+
+    # Fast-path cycle guard if caller requested a harness already in the active delegation chain
+    if preferred_harness and preferred_harness in chain_elements:
         return {
             "status": "cycle_detected",
-            "message": f"Cycle detected in delegation chain '{chain}'. Refusing to re-invoke '{harness_key}'.",
+            "message": f"Cycle detected in delegation chain '{chain}'. Refusing to re-invoke '{preferred_harness}'.",
             "delegation_depth": depth
         }
 
-    h_info = installed[harness_key]
-    spec = HARNESS_SPECS[harness_key]
-    cmd = spec["cmd_builder"](h_info["binary_path"], task)
-    env = build_delegation_env(os.environ, current_harness=harness_key)
+    manifest = discover_harnesses()
+    installed = manifest.get("harnesses", {})
 
-    start_time = time.time()
-    try:
-        returncode, stdout, stderr = await execute_harness_safe(
-            cmd=cmd,
-            cwd=cwd,
-            env=env,
-            timeout_sec=timeout_sec
-        )
-        duration_ms = int((time.time() - start_time) * 1000)
+    primary_harness = preferred_harness
+    if not primary_harness or primary_harness not in installed:
+        primary_harness = select_harness_for_model(preferred_model, manifest)
 
-        # Parse JSON if output format was structured
-        parsed_response = None
+    if not primary_harness:
+        primary_harness = "claude" if ("claude" in preferred_model or "sonnet" in preferred_model) else "opencode"
+
+    # Build failover candidate list
+    candidate_chain = list(HARNESS_FAILOVER_CHAINS.get(primary_harness, [primary_harness, "opencode", "goose"]))
+    if primary_harness not in candidate_chain:
+        candidate_chain.insert(0, primary_harness)
+
+    attempts = []
+    overall_start = time.time()
+    workdir = cwd or os.getcwd()
+
+    for h_name in candidate_chain:
+        # Check cycle detection
+        if h_name in chain_elements:
+            continue
+
+        # Check installation and authentication
+        if h_name not in installed or not installed[h_name].get("authenticated"):
+            attempts.append({
+                "harness": h_name,
+                "status": "skipped",
+                "reason": "not_installed_or_unauthenticated"
+            })
+            continue
+
+        # Check circuit breaker
+        tripped, trip_reason = is_harness_tripped(h_name)
+        if tripped:
+            attempts.append({
+                "harness": h_name,
+                "status": "circuit_breaker_skipped",
+                "reason": trip_reason
+            })
+            continue
+
+        h_info = installed[h_name]
+        spec = HARNESS_SPECS[h_name]
+        cmd = spec["cmd_builder"](h_info["binary_path"], task)
+        env = build_delegation_env(os.environ, current_harness=h_name)
+
+        # 1. Snapshot Git state before execution
+        baseline_git = get_git_state(workdir)
+
+        h_start = time.time()
         try:
-            parsed_response = json.loads(stdout.strip())
-        except Exception:
-            parsed_response = stdout.strip()
+            returncode, stdout, stderr = await execute_harness_safe(
+                cmd=cmd,
+                cwd=workdir,
+                env=env,
+                timeout_sec=min(timeout_sec, 60.0)
+            )
+            h_duration_ms = int((time.time() - h_start) * 1000)
 
-        return {
-            "status": "success" if returncode == 0 else "failed",
-            "exit_code": returncode,
-            "harness": harness_key,
-            "subscription": h_info["subscription"],
-            "model_requested": preferred_model,
-            "duration_ms": duration_ms,
-            "delegation_depth": depth + 1,
-            "response": parsed_response,
-            "raw_stderr": stderr[:500] if returncode != 0 else None
-        }
+            if returncode == 0:
+                reset_harness_circuit_breaker(h_name)
+                parsed_response = None
+                try:
+                    parsed_response = json.loads(stdout.strip())
+                except Exception:
+                    parsed_response = stdout.strip()
 
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "harness": harness_key,
-            "duration_ms": int((time.time() - start_time) * 1000),
-            "delegation_depth": depth + 1
-        }
+                attempts.append({
+                    "harness": h_name,
+                    "status": "success",
+                    "duration_ms": h_duration_ms
+                })
+
+                return {
+                    "status": "success",
+                    "effective_harness": h_name,
+                    "subscription": h_info["subscription"],
+                    "model_requested": preferred_model,
+                    "duration_ms": int((time.time() - overall_start) * 1000),
+                    "delegation_depth": depth + 1,
+                    "response": parsed_response,
+                    "attempts": attempts
+                }
+
+            # Non-zero exit code: classify error
+            is_recoverable, reason, cooldown = classify_harness_error(h_name, returncode, stdout, stderr)
+
+            if not is_recoverable:
+                # User code or test failure: do NOT fail over, do NOT roll back
+                attempts.append({
+                    "harness": h_name,
+                    "status": "failed",
+                    "reason": reason,
+                    "duration_ms": h_duration_ms
+                })
+                return {
+                    "status": "failed",
+                    "effective_harness": h_name,
+                    "exit_code": returncode,
+                    "reason": reason,
+                    "raw_stderr": stderr[:500],
+                    "raw_stdout": stdout[:500],
+                    "attempts": attempts,
+                    "duration_ms": int((time.time() - overall_start) * 1000),
+                    "delegation_depth": depth + 1
+                }
+
+            # Recoverable infra error (429, timeout, crash): trip circuit breaker & selective rollback
+            trip_harness_circuit_breaker(h_name, reason, cooldown)
+            rolled_back = rollback_git_state(workdir, baseline_git)
+
+            attempts.append({
+                "harness": h_name,
+                "status": "failover",
+                "reason": reason,
+                "duration_ms": h_duration_ms,
+                "rolled_back": rolled_back
+            })
+            logger.warning(f"Harness {h_name} failed with {reason}. Rolled back new mutations and failing over.")
+
+        except TimeoutError:
+            trip_harness_circuit_breaker(h_name, "timeout", 300)
+            rolled_back = rollback_git_state(workdir, baseline_git)
+            attempts.append({
+                "harness": h_name,
+                "status": "timeout_failover",
+                "duration_ms": int((time.time() - h_start) * 1000),
+                "rolled_back": rolled_back
+            })
+
+        except Exception as e:
+            attempts.append({
+                "harness": h_name,
+                "status": "exception",
+                "error": str(e),
+                "duration_ms": int((time.time() - h_start) * 1000)
+            })
+
+    # All CLI harnesses exhausted: Fall back to remote HTTP gateway
+    logger.info("All CLI subscription harnesses exhausted. Falling back to Reflex HTTP Gateway.")
+    gateway_res = await call_reflex_http_gateway(task, preferred_model)
+    attempts.append({
+        "harness": "reflex_http_gateway",
+        "status": gateway_res.get("status"),
+        "duration_ms": gateway_res.get("duration_ms")
+    })
+
+    return {
+        "status": gateway_res.get("status", "failed"),
+        "effective_harness": "reflex_http_gateway",
+        "response": gateway_res.get("response") or gateway_res.get("error"),
+        "model_requested": preferred_model,
+        "attempts": attempts,
+        "duration_ms": int((time.time() - overall_start) * 1000),
+        "delegation_depth": depth + 1
+    }
