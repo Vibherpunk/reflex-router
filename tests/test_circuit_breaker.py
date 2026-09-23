@@ -46,6 +46,38 @@ async def test_circuit_breaker_half_open_single_canary():
     assert cb.canary_in_flight is False
 
 @pytest.mark.anyio
+async def test_circuit_breaker_canary_lease_expiry_prevents_deadlock():
+    """HALF_OPEN must not deadlock when a canary probe is never resolved.
+
+    If the caller times out / crashes / forgets to record success or failure,
+    the canary slot is held forever and the provider is locked out of the
+    circuit permanently. The lease must expire and grant a replacement canary.
+    """
+    cb = ProviderCircuitBreaker(
+        "test-sub", base_cooldown=0.05, max_cooldown=1.0, jitter=0.0,
+        canary_lease_seconds=0.1
+    )
+    await cb.record_failure(status_code=429)
+    await asyncio.sleep(0.06)
+
+    # Cooldown expired -> canary probe granted
+    assert await cb.can_attempt() is True
+    assert cb.canary_in_flight is True
+
+    # Slot held while the lease is active
+    assert await cb.can_attempt() is False
+
+    # Simulate an unresolved canary (no record_success / record_failure ever
+    # arrives): after the lease expires, the breaker must recover.
+    await asyncio.sleep(0.12)
+    assert await cb.can_attempt() is True
+    assert cb.canary_in_flight is True
+
+    # Once the new canary resolves, normal FSM semantics apply.
+    await cb.record_success()
+    assert cb.state == BreakerState.CLOSED
+
+@pytest.mark.anyio
 async def test_circuit_breaker_canary_failure_exponential():
     cb = ProviderCircuitBreaker("test-sub", base_cooldown=0.05, max_cooldown=10.0, jitter=0.0)
     await cb.record_failure(status_code=429)

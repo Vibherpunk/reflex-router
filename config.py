@@ -63,6 +63,7 @@ CONFIG: Dict[str, Any] = {
         "base_cooldown_seconds": 30.0,
         "max_cooldown_seconds": 300.0,
         "jitter_seconds": 5.0,
+        "canary_lease_seconds": 60.0,
     },
     "providers": {
         "opencode-go": {

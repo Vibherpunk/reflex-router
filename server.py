@@ -34,7 +34,8 @@ BREAKER_REGISTRY: Dict[str, ProviderCircuitBreaker] = {
         name=name,
         base_cooldown=CONFIG["circuit_breaker"]["base_cooldown_seconds"],
         max_cooldown=CONFIG["circuit_breaker"]["max_cooldown_seconds"],
-        jitter=CONFIG["circuit_breaker"]["jitter_seconds"]
+        jitter=CONFIG["circuit_breaker"]["jitter_seconds"],
+        canary_lease_seconds=CONFIG["circuit_breaker"]["canary_lease_seconds"]
     )
     for name, p in CONFIG["providers"].items()
     if p["type"] == "subscription"
@@ -295,6 +296,10 @@ async def preflight_and_stream(
     if stream_response.status_code >= 400:
         err_bytes = await stream_response.aread()
         await upstream_ctx.__aexit__(None, None, None)
+        # A provider error on the subscription route must release the canary slot
+        # (and trip the breaker); otherwise HALF_OPEN deadlocks forever.
+        if target_route["provider"] == sub_prov_name and sub_breaker:
+            await sub_breaker.record_failure(stream_response.status_code)
         err_obj = normalize_error(stream_response.status_code, err_bytes)
         raise HTTPException(status_code=stream_response.status_code, detail=err_obj["error"])
 
@@ -308,6 +313,10 @@ async def preflight_and_stream(
         first_chunk = await asyncio.wait_for(aiter.__anext__(), timeout=20.0)
     except (asyncio.TimeoutError, StopAsyncIteration):
         await upstream_ctx.__aexit__(None, None, None)
+        # The canary probe never produced a byte: record the failure so the
+        # breaker does not remain parked in HALF_OPEN indefinitely.
+        if target_route["provider"] == sub_prov_name and sub_breaker:
+            await sub_breaker.record_failure(504)
         raise HTTPException(status_code=504, detail="Upstream gateway timed out waiting for initial chunk.")
 
     # 4. Stream Generator (Headers commit ONLY after this point)
@@ -392,7 +401,7 @@ async def chat_completions(request: Request):
 
         try:
             resp = await client.post(upstream_url, headers=headers, json=active_payload)
-            if resp.status_code in (429, 502, 503) and target["provider"] == sub_prov_name:
+            if resp.status_code in (429, 502, 503, 504) and target["provider"] == sub_prov_name:
                 if sub_breaker:
                     await sub_breaker.record_failure(resp.status_code)
                 target = metered_route
@@ -403,6 +412,10 @@ async def chat_completions(request: Request):
                 resp = await client.post(upstream_url, headers=headers, json=active_payload)
 
             if resp.status_code >= 400:
+                # Any provider error on the subscription route must release/trip the
+                # canary; otherwise the breaker can deadlock in HALF_OPEN forever.
+                if target["provider"] == sub_prov_name and sub_breaker:
+                    await sub_breaker.record_failure(resp.status_code)
                 err_obj = normalize_error(resp.status_code, resp.content)
                 return JSONResponse(status_code=resp.status_code, content=err_obj)
 
@@ -420,6 +433,10 @@ async def chat_completions(request: Request):
                 }
             )
         except Exception as e:
+            # Transport-level failure (timeout / connect error) on the subscription
+            # route must also release the canary slot, or HALF_OPEN deadlocks.
+            if target["provider"] == sub_prov_name and sub_breaker:
+                await sub_breaker.record_failure(0)  # 0 = non-HTTP transport failure
             raise HTTPException(status_code=502, detail=f"Upstream router error: {str(e)}")
 
 if __name__ == "__main__":
