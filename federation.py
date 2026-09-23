@@ -540,7 +540,18 @@ async def delegate_subagent(
 
     primary_harness = preferred_harness
     if not primary_harness or primary_harness not in installed:
-        primary_harness = select_harness_for_model(preferred_model, manifest)
+        if preferred_model == "auto":
+            try:
+                from classifier import classify_request
+                from config import CONFIG
+                tier_num, reason = classify_request([{"role": "user", "content": task}])
+                tier_info = CONFIG["model_tiers"][tier_num]
+                rec_model = tier_info["subscription"]["model"]
+                primary_harness = select_harness_for_model(rec_model, manifest)
+            except Exception:
+                pass
+        if not primary_harness:
+            primary_harness = select_harness_for_model(preferred_model, manifest)
 
     if not primary_harness:
         primary_harness = "claude" if ("claude" in preferred_model or "sonnet" in preferred_model) else "opencode"
