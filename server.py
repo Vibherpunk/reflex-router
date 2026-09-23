@@ -200,6 +200,23 @@ async def get_harnesses(rescan: bool = False):
     """Returns all auto-discovered local CLI agent harnesses on this machine."""
     return discover_harnesses(force_rescan=rescan)
 
+@app.post("/v1/route")
+async def route_preview(request: Request):
+    """Previews tier classification and provider routing without execution."""
+    data = await request.json()
+    prompt = str(data.get("prompt", "")).strip()
+    messages = data.get("messages", [{"role": "user", "content": prompt}])
+    tier_num, reason = classify_request(messages)
+    tier_info = CONFIG["model_tiers"][tier_num]
+    return {
+        "status": "success",
+        "tier": tier_num,
+        "tier_name": tier_info["name"],
+        "reason": reason,
+        "subscription_route": tier_info["subscription"],
+        "metered_route": tier_info["metered"]
+    }
+
 @app.post("/v1/delegate")
 async def handle_delegation(request: Request):
     """
@@ -211,6 +228,17 @@ async def handle_delegation(request: Request):
     if not task:
         raise HTTPException(status_code=400, detail="Task prompt is required")
 
+    delegation_depth = int(data.get("delegation_depth", 0))
+    delegation_chain = str(data.get("delegation_chain", ""))
+    delegation_id = str(data.get("delegation_id", f"del-{int(time.time()*1000)}"))
+
+    if delegation_depth >= 2:
+        return {
+            "status": "error",
+            "error": f"RecursionLimitExceeded: Max delegation depth (2) reached across HTTP boundary. Chain: {delegation_chain}",
+            "delegation_depth": delegation_depth
+        }
+
     preferred_model = data.get("preferred_model", "auto")
     preferred_harness = data.get("preferred_harness")
     cwd = data.get("cwd")
@@ -221,7 +249,10 @@ async def handle_delegation(request: Request):
         preferred_model=preferred_model,
         preferred_harness=preferred_harness,
         cwd=cwd,
-        timeout_sec=timeout
+        timeout_sec=timeout,
+        delegation_depth=delegation_depth,
+        delegation_chain=delegation_chain,
+        delegation_id=delegation_id
     )
     return result
 

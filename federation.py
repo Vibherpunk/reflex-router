@@ -60,6 +60,7 @@ HARNESS_SPECS = {
         "cmd_builder": lambda bin_path, task: [
             bin_path,
             "-p", task,
+            "--output-format", "json",
             "--dangerously-skip-permissions"
         ]
     },
@@ -180,10 +181,15 @@ def discover_harnesses(force_rescan: bool = False) -> Dict[str, Any]:
 
     return manifest
 
-def build_delegation_env(parent_env: Optional[Dict[str, str]] = None, current_harness: str = "") -> Dict[str, str]:
+def build_delegation_env(
+    parent_env: Optional[Dict[str, str]] = None,
+    current_harness: str = "",
+    depth: Optional[int] = None,
+    chain: Optional[str] = None
+) -> Dict[str, str]:
     """
     Builds a secure, non-interactive runtime environment for child agent processes.
-    Enforces recursion limits and cycle detection.
+    Enforces recursion limits, anti-loop suppression, and cycle detection.
     """
     base_env = dict(parent_env or os.environ)
     env = base_env.copy()
@@ -198,11 +204,18 @@ def build_delegation_env(parent_env: Optional[Dict[str, str]] = None, current_ha
     env["PYTHONUNBUFFERED"] = "1"
 
     # 3. Recursion Tracking
-    depth = int(env.get("REFLEX_DELEGATION_DEPTH", "0"))
-    chain = env.get("REFLEX_DELEGATION_CHAIN", "")
+    curr_depth = depth if depth is not None else int(env.get("REFLEX_DELEGATION_DEPTH", "0"))
+    curr_chain = chain if chain is not None else env.get("REFLEX_DELEGATION_CHAIN", "")
 
-    env["REFLEX_DELEGATION_DEPTH"] = str(depth + 1)
-    env["REFLEX_DELEGATION_CHAIN"] = f"{chain}:{current_harness}" if chain else current_harness
+    new_depth = curr_depth + 1
+    new_chain = f"{curr_chain}:{current_harness}" if curr_chain else current_harness
+
+    env["REFLEX_DELEGATION_DEPTH"] = str(new_depth)
+    env["REFLEX_DELEGATION_CHAIN"] = new_chain
+
+    # Anti-loop guard: child agents must not re-invoke reflex delegation tool
+    if new_depth >= MAX_DELEGATION_DEPTH:
+        env["REFLEX_DISABLE_DELEGATION"] = "1"
 
     return env
 
@@ -494,13 +507,16 @@ async def delegate_subagent(
     preferred_model: str = "auto",
     preferred_harness: Optional[str] = None,
     cwd: Optional[str] = None,
-    timeout_sec: float = 120.0
+    timeout_sec: float = 120.0,
+    delegation_depth: Optional[int] = None,
+    delegation_chain: Optional[str] = None,
+    delegation_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Main delegation coordinator with automatic failover waterfall and git rollback barrier.
     """
-    depth = int(os.environ.get("REFLEX_DELEGATION_DEPTH", "0"))
-    chain = os.environ.get("REFLEX_DELEGATION_CHAIN", "")
+    depth = delegation_depth if delegation_depth is not None else int(os.environ.get("REFLEX_DELEGATION_DEPTH", "0"))
+    chain = delegation_chain if delegation_chain is not None else os.environ.get("REFLEX_DELEGATION_CHAIN", "")
 
     if depth >= MAX_DELEGATION_DEPTH:
         return {
@@ -565,7 +581,7 @@ async def delegate_subagent(
         h_info = installed[h_name]
         spec = HARNESS_SPECS[h_name]
         cmd = spec["cmd_builder"](h_info["binary_path"], task)
-        env = build_delegation_env(os.environ, current_harness=h_name)
+        env = build_delegation_env(os.environ, current_harness=h_name, depth=depth, chain=chain)
 
         # 1. Snapshot Git state before execution
         baseline_git = get_git_state(workdir)

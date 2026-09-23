@@ -160,6 +160,28 @@ def test_delegate_endpoint_validation():
     resp = client.post("/v1/delegate", json={"task": ""})
     assert resp.status_code == 400
 
+def test_route_preview_endpoint():
+    resp = client.post("/v1/route", json={"prompt": "Design the system architecture for distributed consensus"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "success"
+    assert data["tier"] == 3
+    assert "subscription_route" in data
+    assert "metered_route" in data
+
+def test_delegate_endpoint_recursion_limit():
+    resp = client.post("/v1/delegate", json={
+        "task": "recursive delegation attempt",
+        "delegation_depth": 2,
+        "delegation_chain": "agy:opencode"
+    })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "error"
+    assert "RecursionLimitExceeded" in data["error"]
+    assert data["delegation_depth"] == 2
+
+
 
 # ---------------------------------------------------------------------------
 # Deadlock regression tests: every failure path must release the canary slot
