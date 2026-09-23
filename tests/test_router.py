@@ -178,6 +178,7 @@ class FakeClient:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = 0
+        self.is_closed = False
         self._closed = False
 
     async def post(self, *args, **kwargs):
@@ -187,6 +188,7 @@ class FakeClient:
 
     async def aclose(self):
         """Release resources held by the fake client (mirrors httpx semantics)."""
+        self.is_closed = True
         self._closed = True
         self._responses.clear()
         return None
