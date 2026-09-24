@@ -7,6 +7,7 @@ __pycache__/
 .DS_Store
 auth.json
 .gate/
+.vibehard/
 plan.md
 research.md
 scratchpad.md

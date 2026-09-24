@@ -31,7 +31,7 @@ def test_classify_domain_legal():
 
 
 def test_classify_domain_medical():
-    messages = [{"role": "user", "content": "Generate a clinical soap note with icd-10 diagnosis codes for patient symptoms."}]
+    messages = [{"role": "user", "content": "Generate a clinical soap note with icd-10 clinical codes for patient symptoms."}]
     domain = classify_domain(messages)
     assert domain == "medical"
 
