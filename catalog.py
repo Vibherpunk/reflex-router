@@ -44,6 +44,8 @@ class ReflexModelDefinition:
     base_url: Optional[str] = None # Upstream HTTP URL for http_gateway
     api_key_env: Optional[str] = None # Environment variable holding authentication key
     harness_binary: Optional[str] = None # Harness name for cli_harness dispatch (e.g. "claude")
+    generation: Optional[float] = None # Extracted model generation float (e.g. 3.7, 2.0)
+    tier: str = "Base"             # Architectural tier (Flagship, Mid, Flash, Mini, Rsng, Base)
 
 _SCORING_OVERLAY: List[Dict[str, Any]] = []
 _SCORING_DEFAULT: Dict[str, float] = {
@@ -65,17 +67,230 @@ def load_scoring_overlay() -> None:
     except Exception:
         pass
 
-def score_model(model_id: str) -> Dict[str, float]:
-    """Dynamically applies subjective capability scores via pattern matching overlay."""
+
+def extract_model_semantics(model_id: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Semantic Version & Feature Extractor.
+    Parses arbitrary model IDs into 4 orthogonal dimensions:
+    - Family (Claude, GPT, Gemini, Llama, DeepSeek, Qwen, Mistral, etc.)
+    - Generation (float e.g. 3.7, 3.5, 2.0, 4.0, or None)
+    - Variant / Tier (Flagship, Mid, Flash, Mini, Rsng, Base)
+    - Specialization (is_reasoning, is_coder)
+    Integrates upstream metadata (modality, instruct_type, description) when available.
+    """
+    mid = model_id.lower()
+    clean_id = mid.split("/")[-1]
+
+    # Strip timestamps and common non-generational suffixes
+    clean_base = re.sub(r"[-_](20\d{6}|\d{4,8})", "", clean_id)
+    clean_base = re.sub(r"(:batch|-preview|-exp.*|@\d+)", "", clean_base)
+
+    # 1. Family detection
+    family = "unknown"
+    if any(k in clean_id for k in ["claude", "anthropic"]):
+        family = "claude"
+    elif any(k in clean_id for k in ["gemini", "gemma", "google"]):
+        family = "gemini"
+    elif any(k in clean_id for k in ["deepseek"]):
+        family = "deepseek"
+    elif any(k in clean_id for k in ["gpt", "openai", "o1", "o3", "o4"]):
+        family = "openai"
+    elif any(k in clean_id for k in ["llama", "meta"]):
+        family = "llama"
+    elif any(k in clean_id for k in ["qwen"]):
+        family = "qwen"
+    elif any(k in clean_id for k in ["mistral", "mixtral", "codestral"]):
+        family = "mistral"
+    elif any(k in clean_id for k in ["grok"]):
+        family = "grok"
+
+    # 2. Generation extraction
+    gen = None
+    # Skip generation parsing for pure reasoning tags like r1
+    if not re.search(r"\br1\b", clean_base):
+        # Match X.Y or X-Y e.g., 3.7, 3-7, 3.5, 2.5, 2.0, 1.5, 4.5, 3.3, 3.1
+        m_gen = re.search(r"(?:^|[-_a-z])(?:v|version)?(\d+)[._-](\d+)", clean_base)
+        if m_gen:
+            try:
+                val = float(f"{m_gen.group(1)}.{m_gen.group(2)}")
+                if 1.0 <= val <= 10.0:
+                    gen = val
+            except ValueError:
+                pass
+
+        if gen is None:
+            # Check single digit e.g. claude-3, gpt-4, llama-3, v4, v3, opus-5, o3, o1
+            m_single = re.search(r"(?:claude|gpt|llama|deepseek|qwen|mistral|gemini|opus|sonnet|haiku|o|v)[-_]?(\d+)(?![\d])", clean_base)
+            if m_single:
+                try:
+                    val = float(m_single.group(1))
+                    if 1.0 <= val <= 10.0:
+                        gen = val
+                except ValueError:
+                    pass
+
+    # Upstream telemetry inspection
+    upstream_text = ""
+    if metadata and isinstance(metadata, dict):
+        arch = metadata.get("architecture")
+        arch_str = json.dumps(arch) if isinstance(arch, dict) else str(arch or "")
+        upstream_text = f"{metadata.get('description', '')} {arch_str} {metadata.get('displayName', '')}".lower()
+
+    # 3. Specialization
+    is_reasoning = bool(
+        re.search(r"(?:-thinking|thinking|reasoning|reasoner|\br1\b|\bo1\b|\bo3\b|\bo4\b)", clean_id)
+        or re.search(r"(?:chain-of-thought|reasoning model|thinking process|deepseek-r1)", upstream_text)
+    )
+    is_coder = bool(
+        re.search(r"(?:coder|codestral|code)", clean_id)
+        or "code generation" in upstream_text
+    )
+
+    # 4. Variant / Tier (Word boundary protected to avoid "mini" in "gemini")
+    is_flash = bool(re.search(r"(?:^|[-_.])(?:flash|mini|haiku|small|lite|nano|micro|8b|7b|3b|1b)(?:[-_.]|$)", clean_id))
+    is_flagship = bool(re.search(r"(?:^|[-_.])(?:opus|max|ultra|large|405b|o1-pro|o3-pro)(?:[-_.]|$)", clean_id))
+    is_mid = bool(re.search(r"(?:^|[-_.])(?:sonnet|pro|plus|70b|medium|gpt-4o|4o)(?:[-_.]|$)", clean_id))
+
+    tier = "base"
+    display_tier = "Base"
+
+    if is_flagship:
+        tier = "flagship"
+        display_tier = "Flagship"
+    elif is_flash:
+        tier = "flash"
+        display_tier = "Flash" if "flash" in clean_id else "Mini"
+    elif is_reasoning:
+        tier = "reasoning"
+        display_tier = "Rsng"
+    elif is_mid:
+        tier = "mid"
+        display_tier = "Mid"
+
+    return {
+        "family": family,
+        "generation": gen,
+        "tier": tier,
+        "display_tier": display_tier,
+        "is_reasoning": is_reasoning,
+        "is_coder": is_coder
+    }
+
+
+def compute_scores(semantics: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Mathematical capability matrix:
+    Base_Score = Family_Baseline * Generation_Multiplier * Tier_Weight * Specialization_Bonus
+    """
+    family = semantics.get("family", "unknown")
+    gen = semantics.get("generation")
+    tier = semantics.get("tier", "base")
+    is_reasoning = semantics.get("is_reasoning", False)
+    is_coder = semantics.get("is_coder", False)
+
+    # 1. Family Baselines
+    family_baselines = {
+        "claude":   {"r": 0.83, "a": 0.85, "c": 0.84, "s": 0.75},
+        "openai":   {"r": 0.81, "a": 0.83, "c": 0.83, "s": 0.75},
+        "gemini":   {"r": 0.80, "a": 0.81, "c": 0.82, "s": 0.80},
+        "deepseek": {"r": 0.82, "a": 0.80, "c": 0.82, "s": 0.75},
+        "llama":    {"r": 0.74, "a": 0.76, "c": 0.77, "s": 0.75},
+        "qwen":     {"r": 0.74, "a": 0.76, "c": 0.78, "s": 0.75},
+        "mistral":  {"r": 0.74, "a": 0.76, "c": 0.77, "s": 0.75},
+        "grok":     {"r": 0.75, "a": 0.75, "c": 0.75, "s": 0.70},
+        "unknown":  {"r": 0.60, "a": 0.60, "c": 0.65, "s": 0.65},
+    }
+    base = family_baselines.get(family, family_baselines["unknown"]).copy()
+
+    # 2. Generation Multiplier
+    gen_mult = 1.0
+    if gen is not None:
+        if family == "claude":
+            gen_mult = 1.0 + max(-0.15, (gen - 3.0) * 0.12)
+        elif family == "gemini":
+            gen_mult = 1.0 + max(-0.15, (gen - 1.5) * 0.10)
+        elif family == "deepseek":
+            gen_mult = 1.0 + max(-0.15, (gen - 3.0) * 0.10)
+        elif family == "openai":
+            if gen >= 4.0:
+                gen_mult = 1.0 + (gen - 4.0) * 0.10
+            elif 1.0 < gen < 4.0:
+                gen_mult = 0.90
+        elif family in ("llama", "qwen", "mistral"):
+            gen_mult = 1.0 + max(-0.15, (gen - 3.0) * 0.08)
+        else:
+            gen_mult = 1.0 + max(-0.15, min(0.3, (gen - 2.0) * 0.08))
+
+    r = base["r"] * gen_mult
+    a = base["a"] * gen_mult
+    c = base["c"] * gen_mult
+    s = base["s"]
+
+    # 3. Tier Weight
+    tier_weights = {
+        "flagship": {"r": 1.10, "a": 1.12, "c": 1.08, "s": 0.70},
+        "mid":      {"r": 1.04, "a": 1.06, "c": 1.06, "s": 0.95},
+        "flash":    {"r": 0.85, "a": 0.82, "c": 0.90, "s": 1.25},
+        "reasoning":{"r": 1.15, "a": 1.10, "c": 1.10, "s": 0.75},
+        "base":     {"r": 1.00, "a": 1.00, "c": 1.00, "s": 1.00},
+    }
+    tw = tier_weights.get(tier, tier_weights["base"])
+    r *= tw["r"]
+    a *= tw["a"]
+    c *= tw["c"]
+    s *= tw["s"]
+
+    # 4. Specialization Bonuses
+    if is_reasoning:
+        # Automatic +0.25 reasoning boost as mandated by blueprint
+        r += 0.25
+        a += 0.10
+        c += 0.08
+        s = min(s, 0.65)
+
+    if is_coder:
+        c += 0.15
+
+    return {
+        "reasoning_capability": round(min(0.99, max(0.10, r)), 2),
+        "architecture_score": round(min(0.99, max(0.10, a)), 2),
+        "coding_score": round(min(0.99, max(0.10, c)), 2),
+        "speed_score": round(min(0.99, max(0.10, s)), 2),
+    }
+
+
+def score_model(model_id: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Dynamically scores models via Semantic Version & Capability Extractor,
+    with opt-in explicit overrides from providers.yaml taking precedence if defined.
+    """
+    semantics = extract_model_semantics(model_id, metadata=metadata)
+    computed = compute_scores(semantics)
+
+    res = {
+        "reasoning_capability": computed["reasoning_capability"],
+        "architecture_score": computed["architecture_score"],
+        "coding_score": computed["coding_score"],
+        "speed_score": computed["speed_score"],
+        "generation": semantics.get("generation"),
+        "tier": semantics.get("display_tier", "Base"),
+    }
+
+    # Explicit opt-in overrides in providers.yaml
     for rule in _SCORING_OVERLAY:
         pattern = rule.get("match", "")
         if pattern and re.search(pattern, model_id):
-            res = dict(_SCORING_DEFAULT)
             for k, v in rule.items():
                 if k != "match":
-                    res[k] = float(v)
-            return res
-    return dict(_SCORING_DEFAULT)
+                    if k in ("reasoning_capability", "architecture_score", "coding_score", "speed_score"):
+                        res[k] = float(v)
+                    elif k == "generation":
+                        res[k] = float(v) if v is not None else None
+                    elif k == "tier":
+                        res[k] = str(v)
+            break
+
+    return res
 
 
 class ModelCatalog:
@@ -117,11 +332,21 @@ class ModelCatalog:
                     base_url TEXT,
                     api_key_env TEXT,
                     harness_binary TEXT,
+                    generation REAL,
+                    tier TEXT,
                     PRIMARY KEY (id, provider)
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_billing ON models(billing_type)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_provider ON models(provider)")
+            try:
+                conn.execute("ALTER TABLE models ADD COLUMN generation REAL")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE models ADD COLUMN tier TEXT")
+            except sqlite3.OperationalError:
+                pass
 
     def _load_cache(self):
         with self._connect() as conn:
@@ -132,6 +357,12 @@ class ModelCatalog:
             for row in cursor.fetchall():
                 d = dict(row)
                 d["tool_calling"] = bool(d["tool_calling"])
+                if d.get("generation") is None or not d.get("tier") or d.get("tier") == "Base":
+                    sem = extract_model_semantics(d["id"])
+                    if d.get("generation") is None:
+                        d["generation"] = sem.get("generation")
+                    if not d.get("tier") or d.get("tier") == "Base":
+                        d["tier"] = sem.get("display_tier", "Base")
                 key = f"{d['provider']}::{d['id']}"
                 new_cache[key] = ReflexModelDefinition(**d)
                 ensure_breaker(d["provider"])
@@ -165,7 +396,7 @@ class ModelCatalog:
                     :context_window, :max_output_tokens, :reasoning_capability,
                     :architecture_score, :coding_score, :speed_score,
                     :tool_calling, :input_cost_per_m, :output_cost_per_m, :last_updated,
-                    :base_url, :api_key_env, :harness_binary
+                    :base_url, :api_key_env, :harness_binary, :generation, :tier
                 )
             """, [{**asdict(m), "tool_calling": int(m.tool_calling)} for m in models])
 
@@ -177,6 +408,18 @@ class ModelCatalog:
             self._per_provider_refresh[m.provider] = now
             ensure_breaker(m.provider)
         self._memory_cache = new_cache
+
+    def rescore_all(self):
+        """Re-evaluates all cached models with current heuristic scoring and persists them."""
+        models = self.list_all()
+        updated = []
+        for m in models:
+            scores = score_model(m.id)
+            for k, v in scores.items():
+                if hasattr(m, k):
+                    setattr(m, k, v)
+            updated.append(m)
+        self.upsert_models(updated)
 
     def refresh_from_providers(self, force: bool = False):
         """Discovers models from all available live CLI harnesses and APIs."""
@@ -225,7 +468,7 @@ class ModelCatalog:
                 mid = item.get("id")
                 if not mid:
                     continue
-                scores = score_model(mid)
+                scores = score_model(mid, metadata=item)
                 results.append(ReflexModelDefinition(
                     id=mid,
                     display_name=item.get("name", mid),
@@ -264,7 +507,7 @@ class ModelCatalog:
                 methods = item.get("supportedGenerationMethods", [])
                 if "generateContent" not in methods:
                     continue
-                scores = score_model(mid)
+                scores = score_model(mid, metadata=item)
                 results.append(ReflexModelDefinition(
                     id=mid,
                     display_name=item.get("displayName", mid),
@@ -315,7 +558,7 @@ class ModelCatalog:
                     if not mid or mid in seen_ids:
                         continue
                     seen_ids.add(mid)
-                    scores = score_model(mid)
+                    scores = score_model(mid, metadata=m)
                     ctx = int(m.get("hard_limit") or 200_000)
                     results.append(ReflexModelDefinition(
                         id=mid,
@@ -357,7 +600,7 @@ class ModelCatalog:
                 inp = float(pricing.get("prompt", 0.0)) * 1_000_000
                 outp = float(pricing.get("completion", 0.0)) * 1_000_000
                 ctx = int(item.get("context_length") or 128_000)
-                scores = score_model(mid)
+                scores = score_model(mid, metadata=item)
 
                 results.append(ReflexModelDefinition(
                     id=mid,

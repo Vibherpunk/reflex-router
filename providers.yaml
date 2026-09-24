@@ -1,43 +1,19 @@
 # Reflex Model Scoring Overlay Configuration
-# Model identity and objective metadata (context length, pricing, tool support) are discovered dynamically.
-# This file provides the subjective capability scoring rules matched by regex against model IDs.
+# Model identity, capabilities, generations, and tiers are discovered and scored
+# mathematically by Reflex's Semantic Version & Capability Extractor.
+#
+# This file is strictly for OPT-IN manual overrides or user preferences
+# (e.g. pinning a model's score, blacklisting/derating, or adjusting custom tiers).
+# If empty, Reflex uses the dynamic capability scoring engine with zero manual maintenance.
 
-scoring_overrides:
-  - match: "(?i)claude-opus.*"
-    reasoning_capability: 0.98
-    architecture_score: 0.99
-    coding_score: 0.96
-    speed_score: 0.50
-
-  - match: "(?i)claude-sonnet.*"
-    reasoning_capability: 0.92
-    architecture_score: 0.96
-    coding_score: 0.95
-    speed_score: 0.75
-
-  - match: "(?i)gemini-.*pro.*"
-    reasoning_capability: 0.90
-    architecture_score: 0.92
-    coding_score: 0.90
-    speed_score: 0.70
-
-  - match: "(?i)(?:.*max.*|.*pro.*|.*r1.*|.*reasoning.*|.*o3.*|.*o1.*)"
-    reasoning_capability: 0.95
-    architecture_score: 0.90
-    coding_score: 0.92
-    speed_score: 0.60
-
-  - match: "(?i).*plus.*"
-    reasoning_capability: 0.60
-    architecture_score: 0.70
-    coding_score: 0.85
-    speed_score: 0.80
-
-  - match: "(?i)(?:.*flash.*|.*mini.*|.*haiku.*)"
-    reasoning_capability: 0.20
-    architecture_score: 0.40
-    coding_score: 0.70
-    speed_score: 0.95
+scoring_overrides: []
+  # Example override:
+  # - match: "(?i)custom-experimental-model.*"
+  #   reasoning_capability: 0.99
+  #   architecture_score: 0.95
+  #   coding_score: 0.95
+  #   speed_score: 0.80
+  #   tier: "Flagship"
 
 default:
   reasoning_capability: 0.50

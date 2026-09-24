@@ -281,8 +281,29 @@ class ArbitrationSolver:
             }
             return route, route, f"Emergency fallback: selected {best.id} ({best.provider})"
 
-        # 5. Route selection
-        primary_model = eligible_sub[0][1] if eligible_sub else eligible_metered[0][1]
+        # 5. Route selection with Dynamic Metered Override
+        best_sub = eligible_sub[0] if eligible_sub else None
+        best_metered = eligible_metered[0] if eligible_metered else None
+
+        # Dynamic Metered Override Threshold (Fixing Subscription Monopoly)
+        # Subscriptions win for routine tasks (Tier 0/1). For complex reasoning / architecture (Tier 2/3),
+        # a metered frontier model overrides subscription if fitness delta > 0.20 (20% better).
+        FITNESS_OVERRIDE_THRESHOLD = 0.20
+
+        metered_override = False
+        if best_sub and best_metered and vector.tier_num >= 2:
+            if (best_metered[0] - best_sub[0]) > FITNESS_OVERRIDE_THRESHOLD:
+                primary_model = best_metered[1]
+                metered_override = True
+            else:
+                primary_model = best_sub[1]
+        elif best_sub:
+            primary_model = best_sub[1]
+        elif best_metered:
+            primary_model = best_metered[1]
+        else:
+            primary_model = eligible_metered[0][1] if eligible_metered else eligible_sub[0][1]
+
         fallback_model = eligible_metered[0][1] if eligible_metered else primary_model
 
         primary_route = {
@@ -306,9 +327,19 @@ class ArbitrationSolver:
                 "last_used": time.time()
             }
 
+        if metered_override:
+            primary_label = f"Primary Metered: {primary_model.id} ({primary_model.provider})"
+            explanation_suffix = " (Metered override due to high capability delta)"
+        elif primary_model.billing_type == "subscription":
+            primary_label = f"Primary Sub: {primary_model.id} ({primary_model.provider})"
+            explanation_suffix = ""
+        else:
+            primary_label = f"Primary Metered: {primary_model.id} ({primary_model.provider})"
+            explanation_suffix = ""
+
         explanation = (
             f"Dynamic Match (Req: R={vector.reasoning_depth:.2f}, A={vector.architecture_score:.2f}) -> "
-            f"Primary Sub: {primary_model.id} ({primary_model.provider}), "
-            f"Fallback: {fallback_model.id} ({fallback_model.provider}) [{vector.explanation}]"
+            f"{primary_label}, "
+            f"Fallback: {fallback_model.id} ({fallback_model.provider}) [{vector.explanation}]{explanation_suffix}"
         )
         return primary_route, metered_route, explanation
