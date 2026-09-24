@@ -5,6 +5,7 @@ and API endpoints without hardcoded model tables.
 """
 import os
 import re
+import math
 import json
 import sqlite3
 import shutil
@@ -180,7 +181,9 @@ def extract_model_semantics(model_id: str, metadata: Optional[Dict[str, Any]] = 
 def compute_scores(semantics: Dict[str, Any]) -> Dict[str, float]:
     """
     Mathematical capability matrix:
-    Base_Score = Family_Baseline * Generation_Multiplier * Tier_Weight * Specialization_Bonus
+    Base_Score = Family_Baseline + Asymptotic_Generation_Bonus + Tier_Delta + Specialization_Bonus
+    Uses asymptotic progression to prevent ceiling saturation and preserve generational differentiation
+    (e.g., Claude Opus 5.5 > Opus 5.0 > Opus 4.8 > Opus 4.1 > Sonnet 3.7 > Sonnet 3.5).
     """
     family = semantics.get("family", "unknown")
     gen = semantics.get("generation")
@@ -190,62 +193,65 @@ def compute_scores(semantics: Dict[str, Any]) -> Dict[str, float]:
 
     # 1. Family Baselines
     family_baselines = {
-        "claude":   {"r": 0.83, "a": 0.85, "c": 0.84, "s": 0.75},
-        "openai":   {"r": 0.81, "a": 0.83, "c": 0.83, "s": 0.75},
-        "gemini":   {"r": 0.80, "a": 0.81, "c": 0.82, "s": 0.80},
-        "deepseek": {"r": 0.82, "a": 0.80, "c": 0.82, "s": 0.75},
-        "llama":    {"r": 0.74, "a": 0.76, "c": 0.77, "s": 0.75},
-        "qwen":     {"r": 0.74, "a": 0.76, "c": 0.78, "s": 0.75},
-        "mistral":  {"r": 0.74, "a": 0.76, "c": 0.77, "s": 0.75},
+        "claude":   {"r": 0.84, "a": 0.86, "c": 0.85, "s": 0.75},
+        "openai":   {"r": 0.82, "a": 0.84, "c": 0.84, "s": 0.75},
+        "gemini":   {"r": 0.81, "a": 0.82, "c": 0.83, "s": 0.80},
+        "deepseek": {"r": 0.82, "a": 0.81, "c": 0.82, "s": 0.75},
+        "llama":    {"r": 0.75, "a": 0.76, "c": 0.77, "s": 0.75},
+        "qwen":     {"r": 0.75, "a": 0.76, "c": 0.78, "s": 0.75},
+        "mistral":  {"r": 0.75, "a": 0.76, "c": 0.77, "s": 0.75},
         "grok":     {"r": 0.75, "a": 0.75, "c": 0.75, "s": 0.70},
         "unknown":  {"r": 0.60, "a": 0.60, "c": 0.65, "s": 0.65},
     }
     base = family_baselines.get(family, family_baselines["unknown"]).copy()
 
-    # 2. Generation Multiplier
-    gen_mult = 1.0
+    # 2. Generational Asymptotic Curve
+    gen_bonus = 0.0
     if gen is not None:
         if family == "claude":
-            gen_mult = 1.0 + max(-0.15, (gen - 3.0) * 0.12)
+            delta = gen - 3.0
+            gen_bonus = 0.15 * (1.0 - math.exp(-0.45 * max(-1.0, delta)))
         elif family == "gemini":
-            gen_mult = 1.0 + max(-0.15, (gen - 1.5) * 0.10)
+            delta = gen - 1.5
+            gen_bonus = 0.15 * (1.0 - math.exp(-0.45 * max(-1.0, delta)))
         elif family == "deepseek":
-            gen_mult = 1.0 + max(-0.15, (gen - 3.0) * 0.10)
+            delta = gen - 3.0
+            gen_bonus = 0.15 * (1.0 - math.exp(-0.45 * max(-1.0, delta)))
         elif family == "openai":
             if gen >= 4.0:
-                gen_mult = 1.0 + (gen - 4.0) * 0.10
+                delta = gen - 4.0
+                gen_bonus = 0.15 * (1.0 - math.exp(-0.45 * delta))
             elif 1.0 < gen < 4.0:
-                gen_mult = 0.90
-        elif family in ("llama", "qwen", "mistral"):
-            gen_mult = 1.0 + max(-0.15, (gen - 3.0) * 0.08)
+                gen_bonus = -0.06
         else:
-            gen_mult = 1.0 + max(-0.15, min(0.3, (gen - 2.0) * 0.08))
+            delta = gen - 3.0
+            gen_bonus = 0.12 * (1.0 - math.exp(-0.35 * max(-1.0, delta)))
 
-    r = base["r"] * gen_mult
-    a = base["a"] * gen_mult
-    c = base["c"] * gen_mult
+    r = base["r"] + gen_bonus
+    a = base["a"] + gen_bonus
+    c = base["c"] + gen_bonus
     s = base["s"]
 
-    # 3. Tier Weight
-    tier_weights = {
-        "flagship": {"r": 1.10, "a": 1.12, "c": 1.08, "s": 0.70},
-        "mid":      {"r": 1.04, "a": 1.06, "c": 1.06, "s": 0.95},
-        "flash":    {"r": 0.85, "a": 0.82, "c": 0.90, "s": 1.25},
-        "reasoning":{"r": 1.15, "a": 1.10, "c": 1.10, "s": 0.75},
-        "base":     {"r": 1.00, "a": 1.00, "c": 1.00, "s": 1.00},
+    # 3. Tier Weight Deltas
+    tier_deltas = {
+        "flagship": {"r": 0.05, "a": 0.06, "c": 0.04, "s": -0.15},
+        "mid":      {"r": 0.03, "a": 0.04, "c": 0.04, "s": -0.05},
+        "flash":    {"r": -0.08, "a": -0.10, "c": -0.04, "s": 0.20},
+        "reasoning":{"r": 0.08, "a": 0.05, "c": 0.05, "s": -0.15},
+        "base":     {"r": 0.00, "a": 0.00, "c": 0.00, "s": 0.00},
     }
-    tw = tier_weights.get(tier, tier_weights["base"])
-    r *= tw["r"]
-    a *= tw["a"]
-    c *= tw["c"]
-    s *= tw["s"]
+    td = tier_deltas.get(tier, tier_deltas["base"])
+    r += td["r"]
+    a += td["a"]
+    c += td["c"]
+    s += td["s"]
 
     # 4. Specialization Bonuses
     if is_reasoning:
         # Automatic +0.25 reasoning boost as mandated by blueprint
         r += 0.25
-        a += 0.10
-        c += 0.08
+        a += 0.08
+        c += 0.06
         s = min(s, 0.65)
 
     if is_coder:

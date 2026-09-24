@@ -258,9 +258,9 @@ class ArbitrationSolver:
                     cost_penalty = (m.input_cost_per_m + m.output_cost_per_m) / 200.0
                     eligible_metered.append((fitness - cost_penalty, m))
 
-        # Sort descending by fitness
-        eligible_sub.sort(key=lambda x: x[0], reverse=True)
-        eligible_metered.sort(key=lambda x: x[0], reverse=True)
+        # Sort descending by fitness, breaking ties with generation and reasoning capability
+        eligible_sub.sort(key=lambda x: (x[0], x[1].generation if x[1].generation is not None else 0.0, x[1].reasoning_capability), reverse=True)
+        eligible_metered.sort(key=lambda x: (x[0], x[1].generation if x[1].generation is not None else 0.0, x[1].reasoning_capability), reverse=True)
 
         # 4. Emergency Fallback: If no providers met constraints, find healthy emergency models
         if not eligible_sub and not eligible_metered:

@@ -79,11 +79,33 @@ def cmd_catalog_audit(args):
     # Sort order
     sort_key = getattr(args, "sort", "r_cap")
     if sort_key == "r_cap":
-        models.sort(key=lambda m: (m.reasoning_capability, m.architecture_score, m.coding_score), reverse=True)
+        models.sort(
+            key=lambda m: (
+                m.reasoning_capability,
+                m.generation if m.generation is not None else 0.0,
+                m.architecture_score,
+                m.coding_score,
+            ),
+            reverse=True,
+        )
     elif sort_key == "a_score":
-        models.sort(key=lambda m: (m.architecture_score, m.reasoning_capability), reverse=True)
+        models.sort(
+            key=lambda m: (
+                m.architecture_score,
+                m.generation if m.generation is not None else 0.0,
+                m.reasoning_capability,
+            ),
+            reverse=True,
+        )
     elif sort_key == "c_score":
-        models.sort(key=lambda m: (m.coding_score, m.reasoning_capability), reverse=True)
+        models.sort(
+            key=lambda m: (
+                m.coding_score,
+                m.generation if m.generation is not None else 0.0,
+                m.reasoning_capability,
+            ),
+            reverse=True,
+        )
     elif sort_key == "cost":
         models.sort(key=lambda m: (m.input_cost_per_m + m.output_cost_per_m))
     elif sort_key == "provider":

@@ -40,6 +40,27 @@ def test_generational_capability_leaps():
     assert s_30["generation"] == 3.0
 
 
+def test_opus_generational_progression():
+    """Verifies that Opus 5.5 mathematically leads earlier Opus releases and avoids ceiling saturation."""
+    s_55 = score_model("anthropic/claude-opus-5.5")
+    s_50 = score_model("claude-opus-5")
+    s_48 = score_model("claude-opus-4-8")
+    s_41 = score_model("claude-opus-4-1")
+
+    assert s_55["generation"] == 5.5
+    assert s_50["generation"] == 5.0
+    assert s_48["generation"] == 4.8
+    assert s_41["generation"] == 4.1
+
+    # Asymptotic progression: 5.5 >= 5.0 > 4.8 > 4.1
+    assert s_55["reasoning_capability"] == 0.99
+    assert s_55["architecture_score"] == 0.99
+    assert s_55["coding_score"] == 0.99
+
+    assert s_55["reasoning_capability"] > s_50["reasoning_capability"] >= s_48["reasoning_capability"] > s_41["reasoning_capability"]
+    assert s_55["coding_score"] > s_50["coding_score"] >= s_48["coding_score"] > s_41["coding_score"]
+
+
 def test_specialization_bonuses():
     """Verifies that thinking and reasoning models receive automatic specialization boosts."""
     s_flash = score_model("gemini-2.0-flash")
