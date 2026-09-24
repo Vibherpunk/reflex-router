@@ -15,29 +15,46 @@ REPO_SPEC_FILE = Path(__file__).parent / "scoring_spec.yaml"
 _CACHED_SPEC: Optional[Dict[str, Any]] = None
 _LAST_MTIME: float = 0.0
 
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    result = dict(base)
+    for k, v in overlay.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
 def load_scoring_spec(force_reload: bool = False) -> Dict[str, Any]:
     """
-    Loads scoring specification from ~/.reflex/scoring_spec.yaml if present,
-    otherwise falls back to repo scoring_spec.yaml.
+    Loads base scoring specification from repo scoring_spec.yaml and overlays
+    user overrides from ~/.reflex/scoring_spec.yaml if present.
     Caches the loaded spec and re-reads on file modification.
     """
     global _CACHED_SPEC, _LAST_MTIME
 
-    target_path = USER_SPEC_FILE if USER_SPEC_FILE.exists() else REPO_SPEC_FILE
+    repo_mtime = os.path.getmtime(REPO_SPEC_FILE) if REPO_SPEC_FILE.exists() else 0.0
+    user_mtime = os.path.getmtime(USER_SPEC_FILE) if USER_SPEC_FILE.exists() else 0.0
+    max_mtime = max(repo_mtime, user_mtime)
 
-    if not target_path.exists():
-        # Fallback to empty structure if missing
-        return {}
+    if force_reload or _CACHED_SPEC is None or max_mtime > _LAST_MTIME:
+        base_spec = {}
+        if REPO_SPEC_FILE.exists():
+            try:
+                with open(REPO_SPEC_FILE, "r", encoding="utf-8") as f:
+                    base_spec = yaml.safe_load(f) or {}
+            except Exception:
+                base_spec = {}
 
-    try:
-        mtime = os.path.getmtime(target_path)
-        if force_reload or _CACHED_SPEC is None or mtime > _LAST_MTIME:
-            with open(target_path, "r", encoding="utf-8") as f:
-                _CACHED_SPEC = yaml.safe_load(f) or {}
-            _LAST_MTIME = mtime
-    except Exception:
-        if _CACHED_SPEC is None:
-            _CACHED_SPEC = {}
+        if USER_SPEC_FILE.exists():
+            try:
+                with open(USER_SPEC_FILE, "r", encoding="utf-8") as f:
+                    user_spec = yaml.safe_load(f) or {}
+                    base_spec = _deep_merge(base_spec, user_spec)
+            except Exception:
+                pass
+
+        _CACHED_SPEC = base_spec
+        _LAST_MTIME = max_mtime
 
     return _CACHED_SPEC or {}
 
@@ -102,6 +119,10 @@ def get_fitness_override_threshold() -> float:
     return float(load_scoring_spec().get("arbitration", {}).get("fitness_override_threshold", 0.20))
 
 
+def get_domain_override_threshold() -> float:
+    return float(load_scoring_spec().get("arbitration", {}).get("domain_override_threshold", 0.0))
+
+
 def get_tier_threshold_profile(tier: int) -> Dict[str, float]:
     tier_key = f"tier_{tier}"
     profiles = load_scoring_spec().get("arbitration", {}).get("tier_threshold_profiles", {})
@@ -118,3 +139,16 @@ def get_memory_escalation_defaults(tier: int) -> Dict[str, float]:
 
 def get_classification_param(param_name: str, fallback: Any) -> Any:
     return load_scoring_spec().get("classification", {}).get(param_name, fallback)
+
+
+def get_domain_specializations() -> Dict[str, Any]:
+    return load_scoring_spec().get("domain_specializations", {})
+
+
+def get_domain_config(domain: str) -> Dict[str, Any]:
+    return get_domain_specializations().get(domain, {})
+
+
+def get_domain_boost(domain: str) -> float:
+    return float(get_domain_config(domain).get("boost", 0.0))
+

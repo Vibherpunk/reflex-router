@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 from catalog import ReflexModelDefinition, ModelCatalog
 from circuit_breaker import BREAKER_REGISTRY, ensure_breaker
-from classifier import detect_tool_errors, TIER3_PATTERNS, TIER2_PATTERNS, TIER1_PATTERNS
+from classifier import detect_tool_errors, classify_domain, TIER3_PATTERNS, TIER2_PATTERNS, TIER1_PATTERNS
 from memory import check_memory, record_incident
 import scoring_spec
 
@@ -24,6 +24,7 @@ class CapabilityRequestVector:
     modality: str                  # M: "text", "vision", etc.
     tier_num: int                  # Equivalent tier (0-3) for telemetry
     explanation: str               # Human-readable rationale
+    domain: Optional[str] = None   # Domain specialization (legal, medical, finance, math, etc.)
 
 class ArbitrationSolver:
     def __init__(self, catalog: ModelCatalog):
@@ -46,9 +47,11 @@ class ArbitrationSolver:
                 architecture_score=p0.get("architecture_score", 0.20),
                 modality="text",
                 tier_num=0,
-                explanation="Empty request default"
+                explanation="Empty request default",
+                domain=None
             )
 
+        detected_domain = classify_domain(messages)
         total_chars = sum(len(str(m.get("content", ""))) for m in messages)
         estimated_tokens = max(1, total_chars // 4)
 
@@ -86,7 +89,8 @@ class ArbitrationSolver:
                 architecture_score=p2.get("architecture_score", 0.75),
                 modality="text",
                 tier_num=2,
-                explanation="Escalated to Tier 2: Detected test/compiler error in prior execution"
+                explanation="Escalated to Tier 2: Detected test/compiler error in prior execution",
+                domain=detected_domain
             )
 
         # 2. System 1 Memory Check: Learned incidents
@@ -109,7 +113,8 @@ class ArbitrationSolver:
                         architecture_score=a_score,
                         modality="text",
                         tier_num=esc_tier,
-                        explanation=f"Memory Auto-Escalation (Incident #{inc_id}, sim={sim}): learned from prior failure in '{sample_snippet}'"
+                        explanation=f"Memory Auto-Escalation (Incident #{inc_id}, sim={sim}): learned from prior failure in '{sample_snippet}'",
+                        domain=detected_domain
                     )
             except Exception:
                 pass
@@ -124,7 +129,8 @@ class ArbitrationSolver:
                     architecture_score=p3.get("architecture_score", 0.95),
                     modality="text",
                     tier_num=3,
-                    explanation=f"Matched Tier 3 Architecture pattern: {pattern}"
+                    explanation=f"Matched Tier 3 Architecture pattern: {pattern}",
+                    domain=detected_domain
                 )
 
         # 4. Deep Reasoning / Concurrency patterns (Tier 2)
@@ -137,7 +143,8 @@ class ArbitrationSolver:
                     architecture_score=p2.get("architecture_score", 0.75),
                     modality="text",
                     tier_num=2,
-                    explanation=f"Matched Tier 2 Concurrency pattern: {pattern}"
+                    explanation=f"Matched Tier 2 Concurrency pattern: {pattern}",
+                    domain=detected_domain
                 )
 
         # 5. General Implementation / Feature patterns (Tier 1)
@@ -150,7 +157,8 @@ class ArbitrationSolver:
                     architecture_score=p1.get("architecture_score", 0.50),
                     modality="text",
                     tier_num=1,
-                    explanation=f"Matched Tier 1 Implementation pattern: {pattern}"
+                    explanation=f"Matched Tier 1 Implementation pattern: {pattern}",
+                    domain=detected_domain
                 )
 
         # 6. Length heuristic: substantive implementation threshold
@@ -164,7 +172,8 @@ class ArbitrationSolver:
                 architecture_score=p1.get("architecture_score", 0.50),
                 modality="text",
                 tier_num=1,
-                explanation=f"Assigned Tier 1 by length ({words} words)"
+                explanation=f"Assigned Tier 1 by length ({words} words)",
+                domain=detected_domain
             )
 
         # 7. Default routine query / tool churn (Tier 0)
@@ -175,7 +184,8 @@ class ArbitrationSolver:
             architecture_score=p0.get("architecture_score", 0.20),
             modality="text",
             tier_num=0,
-            explanation="Default Tier 0: Routine query or tool-churn step"
+            explanation="Default Tier 0: Routine query or tool-churn step",
+            domain=detected_domain
         )
 
     def arbitrate(
@@ -253,6 +263,10 @@ class ArbitrationSolver:
                 (m.architecture_score * weights.get("architecture", 0.0))
             )
 
+            # Domain Specialization Boost (declarative via scoring_spec.yaml)
+            if vector.domain and m.domain_specialization == vector.domain:
+                fitness += scoring_spec.get_domain_boost(vector.domain)
+
             if m.billing_type == "subscription":
                 if is_healthy:
                     eligible_sub.append((fitness, m))
@@ -294,11 +308,24 @@ class ArbitrationSolver:
         # Dynamic Metered Override Threshold (Fixing Subscription Monopoly)
         # Subscriptions win for routine tasks (Tier 0/1). For complex reasoning / architecture (Tier 2/3),
         # a metered frontier model overrides subscription if fitness delta > override_threshold.
+        # Purpose-driven domain models override generalists if fitness delta > domain_override_threshold.
         override_threshold = scoring_spec.get_fitness_override_threshold()
+        domain_override_threshold = scoring_spec.get_domain_override_threshold()
 
         metered_override = False
-        if best_sub and best_metered and vector.tier_num >= 2:
-            if (best_metered[0] - best_sub[0]) > override_threshold:
+        domain_override = False
+
+        if best_sub and best_metered:
+            is_domain_specialist_metered = bool(
+                vector.domain and
+                best_metered[1].domain_specialization == vector.domain and
+                best_sub[1].domain_specialization != vector.domain
+            )
+            if is_domain_specialist_metered and (best_metered[0] - best_sub[0]) > domain_override_threshold:
+                primary_model = best_metered[1]
+                metered_override = True
+                domain_override = True
+            elif vector.tier_num >= 2 and (best_metered[0] - best_sub[0]) > override_threshold:
                 primary_model = best_metered[1]
                 metered_override = True
             else:
@@ -333,7 +360,10 @@ class ArbitrationSolver:
                 "last_used": time.time()
             }
 
-        if metered_override:
+        if domain_override:
+            primary_label = f"Primary Metered: {primary_model.id} ({primary_model.provider})"
+            explanation_suffix = f" (Domain specialist override for '{vector.domain}')"
+        elif metered_override:
             primary_label = f"Primary Metered: {primary_model.id} ({primary_model.provider})"
             explanation_suffix = " (Metered override due to high capability delta)"
         elif primary_model.billing_type == "subscription":
@@ -343,8 +373,9 @@ class ArbitrationSolver:
             primary_label = f"Primary Metered: {primary_model.id} ({primary_model.provider})"
             explanation_suffix = ""
 
+        domain_info = f", Domain={vector.domain}" if vector.domain else ""
         explanation = (
-            f"Dynamic Match (Req: R={vector.reasoning_depth:.2f}, A={vector.architecture_score:.2f}) -> "
+            f"Dynamic Match (Req: R={vector.reasoning_depth:.2f}, A={vector.architecture_score:.2f}{domain_info}) -> "
             f"{primary_label}, "
             f"Fallback: {fallback_model.id} ({fallback_model.provider}) [{vector.explanation}]{explanation_suffix}"
         )

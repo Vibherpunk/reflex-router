@@ -48,6 +48,7 @@ class ReflexModelDefinition:
     harness_binary: Optional[str] = None # Harness name for cli_harness dispatch (e.g. "claude")
     generation: Optional[float] = None # Extracted model generation float (e.g. 3.7, 2.0)
     tier: str = "Base"             # Architectural tier (Flagship, Mid, Flash, Mini, Rsng, Base)
+    domain_specialization: Optional[str] = None # Domain specialization (legal, medical, finance, math)
 
 _SCORING_OVERLAY: List[Dict[str, Any]] = []
 _SCORING_DEFAULT: Dict[str, float] = scoring_spec.get_default_scores()
@@ -167,13 +168,23 @@ def extract_model_semantics(model_id: str, metadata: Optional[Dict[str, Any]] = 
         tier = "mid"
         display_tier = "Mid"
 
+    # 5. Domain Specialization (Legal, Medical, Finance, Math, etc.)
+    domain_spec = None
+    domain_cfgs = scoring_spec.get_domain_specializations()
+    for dom_name, dom_info in domain_cfgs.items():
+        tags = dom_info.get("model_tags", [])
+        if any(tag in clean_id for tag in tags) or any(tag in upstream_text for tag in tags):
+            domain_spec = dom_name
+            break
+
     return {
         "family": family,
         "generation": gen,
         "tier": tier,
         "display_tier": display_tier,
         "is_reasoning": is_reasoning,
-        "is_coder": is_coder
+        "is_coder": is_coder,
+        "domain_specialization": domain_spec
     }
 
 
@@ -259,6 +270,7 @@ def score_model(model_id: str, metadata: Optional[Dict[str, Any]] = None) -> Dic
         "speed_score": computed["speed_score"],
         "generation": semantics.get("generation"),
         "tier": semantics.get("display_tier", "Base"),
+        "domain_specialization": semantics.get("domain_specialization"),
     }
 
     # Explicit opt-in overrides in providers.yaml
@@ -319,6 +331,7 @@ class ModelCatalog:
                     harness_binary TEXT,
                     generation REAL,
                     tier TEXT,
+                    domain_specialization TEXT,
                     PRIMARY KEY (id, provider)
                 )
             """)
@@ -332,6 +345,10 @@ class ModelCatalog:
                 conn.execute("ALTER TABLE models ADD COLUMN tier TEXT")
             except sqlite3.OperationalError:
                 pass
+            try:
+                conn.execute("ALTER TABLE models ADD COLUMN domain_specialization TEXT")
+            except sqlite3.OperationalError:
+                pass
 
     def _load_cache(self):
         with self._connect() as conn:
@@ -342,12 +359,14 @@ class ModelCatalog:
             for row in cursor.fetchall():
                 d = dict(row)
                 d["tool_calling"] = bool(d["tool_calling"])
-                if d.get("generation") is None or not d.get("tier") or d.get("tier") == "Base":
+                if d.get("generation") is None or not d.get("tier") or d.get("tier") == "Base" or "domain_specialization" not in d or d.get("domain_specialization") is None:
                     sem = extract_model_semantics(d["id"])
                     if d.get("generation") is None:
                         d["generation"] = sem.get("generation")
                     if not d.get("tier") or d.get("tier") == "Base":
                         d["tier"] = sem.get("display_tier", "Base")
+                    if "domain_specialization" not in d or d.get("domain_specialization") is None:
+                        d["domain_specialization"] = sem.get("domain_specialization")
                 key = f"{d['provider']}::{d['id']}"
                 new_cache[key] = ReflexModelDefinition(**d)
                 ensure_breaker(d["provider"])
@@ -381,7 +400,8 @@ class ModelCatalog:
                     :context_window, :max_output_tokens, :reasoning_capability,
                     :architecture_score, :coding_score, :speed_score,
                     :tool_calling, :input_cost_per_m, :output_cost_per_m, :last_updated,
-                    :base_url, :api_key_env, :harness_binary, :generation, :tier
+                    :base_url, :api_key_env, :harness_binary, :generation, :tier,
+                    :domain_specialization
                 )
             """, [{**asdict(m), "tool_calling": int(m.tool_calling)} for m in models])
 

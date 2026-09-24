@@ -157,6 +157,7 @@ scoring:
 
 arbitration:
   fitness_override_threshold: 0.20
+  domain_override_threshold: 0.0
   cost_penalty_divisor: 200.0
 
   tier_fitness_weights:
@@ -200,3 +201,90 @@ classification:
   memory_threshold: 0.55
   word_count_tier1_threshold: 80
   history_check_turns: 4
+
+domain_specializations:
+  legal:
+    boost: 0.35
+    keywords:
+      - "legal"
+      - "statutory"
+      - "jurisdiction"
+      - "tort"
+      - "contract law"
+      - "litigation"
+      - "master services agreement"
+      - "msa"
+      - "compliance"
+      - "indemnification"
+      - "regulatory"
+      - "patent"
+      - "copyright"
+      - "case law"
+      - "precedent"
+    model_tags:
+      - "legal"
+      - "saul"
+      - "juris"
+      - "law"
+      - "legalbert"
+  medical:
+    boost: 0.35
+    keywords:
+      - "medical"
+      - "clinical"
+      - "diagnosis"
+      - "pharmacology"
+      - "pathology"
+      - "healthcare"
+      - "anatomical"
+      - "icd-10"
+      - "cpt"
+      - "soap note"
+      - "patient"
+      - "symptoms"
+      - "prescription"
+    model_tags:
+      - "med"
+      - "bio"
+      - "biomistral"
+      - "meditron"
+      - "medllama"
+      - "clinical"
+      - "healthcare"
+  finance:
+    boost: 0.30
+    keywords:
+      - "financial modeling"
+      - "gaap"
+      - "balance sheet"
+      - "cash flow"
+      - "irr"
+      - "npv"
+      - "ebitda"
+      - "general ledger"
+      - "tax reconciliation"
+      - "audit trail"
+      - "dcf valuation"
+      - "accounting"
+    model_tags:
+      - "fin"
+      - "finance"
+      - "financial"
+      - "bloomberg"
+      - "finllama"
+  math:
+    boost: 0.30
+    keywords:
+      - "mathematical proof"
+      - "theorem"
+      - "calculus"
+      - "linear algebra"
+      - "discrete math"
+      - "combinatorial"
+      - "differential equation"
+    model_tags:
+      - "math"
+      - "numina"
+      - "llemma"
+      - "mathstral"
+

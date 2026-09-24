@@ -111,3 +111,44 @@ def classify_request(messages: List[Dict[str, Any]]) -> Tuple[int, str]:
 
     # 6. Default to Tier 0 (Fast / Cheap tool churn)
     return 0, "Default Tier 0: Routine query or tool-churn step"
+
+
+def classify_domain(messages: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    Classifies a conversation request into a domain specialization (legal, medical, finance, math).
+    Matches against declarative keywords loaded from scoring_spec.yaml.
+    Returns domain string or None if general.
+    """
+    if not messages:
+        return None
+
+    last_user_content = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            last_user_content = str(msg.get("content", ""))
+            break
+
+    if not last_user_content:
+        return None
+
+    domain_specs = scoring_spec.get_domain_specializations()
+    text = last_user_content.lower()
+
+    for domain_name, domain_info in domain_specs.items():
+        keywords = domain_info.get("keywords", [])
+        for kw in keywords:
+            if re.search(r"\b" + re.escape(kw.lower()) + r"\b", text):
+                return domain_name
+
+    return None
+
+
+def classify_full_request(messages: List[Dict[str, Any]]) -> Tuple[int, str, Optional[str]]:
+    """
+    Classifies both compute tier and domain specialization.
+    Returns (tier, explanation, domain).
+    """
+    tier, explanation = classify_request(messages)
+    domain = classify_domain(messages)
+    return tier, explanation, domain
+
