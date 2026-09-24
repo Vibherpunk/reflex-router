@@ -333,3 +333,53 @@ def test_reflex_cli_catalog_audit(capsys):
     assert "R-Cap" in captured_tbl.out
     assert "A-Score" in captured_tbl.out
     assert "C-Score" in captured_tbl.out
+
+
+def test_declarative_scoring_spec_no_hardcoded_math():
+    """Verifies that scoring and arbitration parameters are loaded from declarative YAML spec."""
+    import scoring_spec
+
+    # Clamp bounds from spec
+    clamp_min, clamp_max = scoring_spec.get_clamp_bounds()
+    assert clamp_min == 0.10
+    assert clamp_max == 0.99
+
+    # Cost penalty divisor and override threshold from spec
+    assert scoring_spec.get_cost_penalty_divisor() == 200.0
+    assert scoring_spec.get_fitness_override_threshold() == 0.20
+
+    # Tier weights from spec
+    weights_0 = scoring_spec.get_arbitration_weights(0)
+    assert weights_0["speed"] == 0.6
+    assert weights_0["coding"] == 0.4
+
+    # Family configs from spec
+    grok_cfg = scoring_spec.get_family_config("grok")
+    assert grok_cfg["anchor_generation"] == 2.0
+    assert grok_cfg["baseline"]["reasoning"] == 0.75
+
+
+def test_cross_family_semantic_extraction():
+    """Verifies semantic version and feature extraction across all major frontier families."""
+    from catalog import extract_model_semantics, score_model
+
+    # Llama 3 (8B) should parse generation 3.0, not 3.8 (avoiding param size as decimal)
+    s_llama_8b = score_model("meta-llama/llama-3-8b-instruct")
+    assert s_llama_8b["generation"] == 3.0
+    assert s_llama_8b["tier"] == "Mini"
+
+    # Grok 3 and Grok 2 single-digit parsing
+    s_grok3 = score_model("x-ai/grok-3")
+    assert s_grok3["generation"] == 3.0
+    s_grok2 = score_model("x-ai/grok-2")
+    assert s_grok2["generation"] == 2.0
+
+    # OpenAI reasoning family
+    s_o3 = score_model("openai/o3-pro")
+    assert s_o3["generation"] == 3.0
+    assert s_o3["reasoning_capability"] == 0.99
+
+    # Qwen coder specialization
+    s_qwen = score_model("qwen/qwen-2.5-coder-32b-instruct")
+    assert s_qwen["generation"] == 2.5
+    assert s_qwen["coding_score"] >= 0.90

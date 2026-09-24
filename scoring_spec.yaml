@@ -1,0 +1,202 @@
+# Reflex Router Scoring & Arbitration Specification
+# Declarative, Zero-Hardcoded-Math capability and routing definition.
+# Both Anton and Antigravity enforce zero magic numbers in executable code.
+
+scoring:
+  clamp:
+    min: 0.10
+    max: 0.99
+
+  default:
+    reasoning_capability: 0.50
+    architecture_score: 0.50
+    coding_score: 0.60
+    speed_score: 0.60
+
+  # Mathematical family capability baselines and asymptotic generational growth parameters:
+  # gen_bonus = max_bonus * (1.0 - exp(-growth_rate * max(min_delta, gen - anchor_generation)))
+  families:
+    claude:
+      baseline:
+        reasoning: 0.84
+        architecture: 0.86
+        coding: 0.85
+        speed: 0.75
+      anchor_generation: 3.0
+      growth_rate: 0.45
+      max_bonus: 0.15
+      min_delta: -1.0
+
+    openai:
+      baseline:
+        reasoning: 0.82
+        architecture: 0.84
+        coding: 0.84
+        speed: 0.75
+      anchor_generation: 4.0
+      growth_rate: 0.45
+      max_bonus: 0.15
+      min_delta: 0.0
+      legacy_generations:
+        min: 1.0
+        max: 4.0
+        penalty: -0.06
+
+    gemini:
+      baseline:
+        reasoning: 0.81
+        architecture: 0.82
+        coding: 0.83
+        speed: 0.80
+      anchor_generation: 1.5
+      growth_rate: 0.45
+      max_bonus: 0.15
+      min_delta: -1.0
+
+    deepseek:
+      baseline:
+        reasoning: 0.82
+        architecture: 0.81
+        coding: 0.82
+        speed: 0.75
+      anchor_generation: 3.0
+      growth_rate: 0.45
+      max_bonus: 0.15
+      min_delta: -1.0
+
+    llama:
+      baseline:
+        reasoning: 0.75
+        architecture: 0.76
+        coding: 0.77
+        speed: 0.75
+      anchor_generation: 3.0
+      growth_rate: 0.35
+      max_bonus: 0.12
+      min_delta: -1.0
+
+    qwen:
+      baseline:
+        reasoning: 0.75
+        architecture: 0.76
+        coding: 0.78
+        speed: 0.75
+      anchor_generation: 2.5
+      growth_rate: 0.35
+      max_bonus: 0.12
+      min_delta: -1.0
+
+    mistral:
+      baseline:
+        reasoning: 0.75
+        architecture: 0.76
+        coding: 0.77
+        speed: 0.75
+      anchor_generation: 3.0
+      growth_rate: 0.35
+      max_bonus: 0.12
+      min_delta: -1.0
+
+    grok:
+      baseline:
+        reasoning: 0.75
+        architecture: 0.75
+        coding: 0.75
+        speed: 0.70
+      anchor_generation: 2.0
+      growth_rate: 0.35
+      max_bonus: 0.12
+      min_delta: -1.0
+
+    unknown:
+      baseline:
+        reasoning: 0.60
+        architecture: 0.60
+        coding: 0.65
+        speed: 0.65
+      anchor_generation: 1.0
+      growth_rate: 0.35
+      max_bonus: 0.10
+      min_delta: -1.0
+
+  tier_deltas:
+    flagship:
+      reasoning: 0.05
+      architecture: 0.06
+      coding: 0.04
+      speed: -0.15
+    mid:
+      reasoning: 0.03
+      architecture: 0.04
+      coding: 0.04
+      speed: -0.05
+    flash:
+      reasoning: -0.08
+      architecture: -0.10
+      coding: -0.04
+      speed: 0.20
+    reasoning:
+      reasoning: 0.08
+      architecture: 0.05
+      coding: 0.05
+      speed: -0.15
+    base:
+      reasoning: 0.00
+      architecture: 0.00
+      coding: 0.00
+      speed: 0.00
+
+  specialization_bonuses:
+    reasoning:
+      reasoning_boost: 0.25
+      architecture_boost: 0.08
+      coding_boost: 0.06
+      max_speed: 0.65
+    coder:
+      coding_boost: 0.15
+
+arbitration:
+  fitness_override_threshold: 0.20
+  cost_penalty_divisor: 200.0
+
+  tier_fitness_weights:
+    tier_0:
+      speed: 0.6
+      coding: 0.4
+    tier_1:
+      coding: 0.5
+      speed: 0.3
+      reasoning: 0.2
+    tier_2:
+      reasoning: 0.6
+      coding: 0.4
+    tier_3:
+      architecture: 0.6
+      reasoning: 0.4
+
+  tier_threshold_profiles:
+    tier_0:
+      reasoning_depth: 0.10
+      architecture_score: 0.20
+    tier_1:
+      reasoning_depth: 0.45
+      architecture_score: 0.50
+    tier_2:
+      reasoning_depth: 0.90
+      architecture_score: 0.75
+    tier_3:
+      reasoning_depth: 0.95
+      architecture_score: 0.95
+
+  memory_escalation_defaults:
+    tier_2:
+      reasoning_depth: 0.60
+      architecture_score: 0.70
+    tier_3:
+      reasoning_depth: 0.95
+      architecture_score: 0.95
+
+classification:
+  memory_threshold: 0.55
+  word_count_tier1_threshold: 80
+  history_check_turns: 4

@@ -13,6 +13,7 @@ from catalog import ReflexModelDefinition, ModelCatalog
 from circuit_breaker import BREAKER_REGISTRY, ensure_breaker
 from classifier import detect_tool_errors, TIER3_PATTERNS, TIER2_PATTERNS, TIER1_PATTERNS
 from memory import check_memory, record_incident
+import scoring_spec
 
 @dataclass
 class CapabilityRequestVector:
@@ -32,12 +33,17 @@ class ArbitrationSolver:
 
     def extract_vector(self, messages: List[Dict[str, Any]], requested_model: str = "auto") -> CapabilityRequestVector:
         """Extracts capability requirements from message context in <2ms."""
+        p0 = scoring_spec.get_tier_threshold_profile(0)
+        p1 = scoring_spec.get_tier_threshold_profile(1)
+        p2 = scoring_spec.get_tier_threshold_profile(2)
+        p3 = scoring_spec.get_tier_threshold_profile(3)
+
         if not messages:
             return CapabilityRequestVector(
                 token_count=0,
-                reasoning_depth=0.1,
+                reasoning_depth=p0.get("reasoning_depth", 0.10),
                 tool_calling=False,
-                architecture_score=0.2,
+                architecture_score=p0.get("architecture_score", 0.20),
                 modality="text",
                 tier_num=0,
                 explanation="Empty request default"
@@ -53,8 +59,9 @@ class ArbitrationSolver:
                 break
 
         # Check for tool calling requests or outputs
+        history_turns = int(scoring_spec.get_classification_param("history_check_turns", 4))
         has_tools = False
-        for msg in reversed(messages[-4:]):
+        for msg in reversed(messages[-history_turns:]):
             if "tools" in msg or "tool_calls" in msg or msg.get("role") == "tool":
                 has_tools = True
                 break
@@ -74,9 +81,9 @@ class ArbitrationSolver:
                     pass
             return CapabilityRequestVector(
                 token_count=estimated_tokens,
-                reasoning_depth=0.90,
+                reasoning_depth=p2.get("reasoning_depth", 0.90),
                 tool_calling=has_tools,
-                architecture_score=0.75,
+                architecture_score=p2.get("architecture_score", 0.75),
                 modality="text",
                 tier_num=2,
                 explanation="Escalated to Tier 2: Detected test/compiler error in prior execution"
@@ -85,14 +92,16 @@ class ArbitrationSolver:
         # 2. System 1 Memory Check: Learned incidents
         if last_user_content:
             try:
-                mem_hit = check_memory(last_user_content, threshold=0.55)
+                mem_threshold = float(scoring_spec.get_classification_param("memory_threshold", 0.55))
+                mem_hit = check_memory(last_user_content, threshold=mem_threshold)
                 if mem_hit:
                     esc_tier = mem_hit["escalated_tier"]
                     inc_id = mem_hit["incident_id"]
                     sim = mem_hit["similarity"]
                     sample_snippet = mem_hit["sample"][:35]
-                    r_depth = 0.95 if esc_tier >= 2 else 0.60
-                    a_score = 0.95 if esc_tier == 3 else 0.70
+                    esc_defaults = scoring_spec.get_memory_escalation_defaults(esc_tier)
+                    r_depth = esc_defaults.get("reasoning_depth", 0.95 if esc_tier >= 2 else 0.60)
+                    a_score = esc_defaults.get("architecture_score", 0.95 if esc_tier == 3 else 0.70)
                     return CapabilityRequestVector(
                         token_count=estimated_tokens,
                         reasoning_depth=r_depth,
@@ -110,9 +119,9 @@ class ArbitrationSolver:
             if re.search(pattern, last_user_content):
                 return CapabilityRequestVector(
                     token_count=estimated_tokens,
-                    reasoning_depth=0.85,
+                    reasoning_depth=p3.get("reasoning_depth", 0.95),
                     tool_calling=has_tools,
-                    architecture_score=0.95,
+                    architecture_score=p3.get("architecture_score", 0.95),
                     modality="text",
                     tier_num=3,
                     explanation=f"Matched Tier 3 Architecture pattern: {pattern}"
@@ -123,9 +132,9 @@ class ArbitrationSolver:
             if re.search(pattern, last_user_content):
                 return CapabilityRequestVector(
                     token_count=estimated_tokens,
-                    reasoning_depth=0.92,
+                    reasoning_depth=p2.get("reasoning_depth", 0.90),
                     tool_calling=has_tools,
-                    architecture_score=0.75,
+                    architecture_score=p2.get("architecture_score", 0.75),
                     modality="text",
                     tier_num=2,
                     explanation=f"Matched Tier 2 Concurrency pattern: {pattern}"
@@ -136,22 +145,23 @@ class ArbitrationSolver:
             if re.search(pattern, last_user_content):
                 return CapabilityRequestVector(
                     token_count=estimated_tokens,
-                    reasoning_depth=0.50,
+                    reasoning_depth=p1.get("reasoning_depth", 0.45),
                     tool_calling=has_tools,
-                    architecture_score=0.55,
+                    architecture_score=p1.get("architecture_score", 0.50),
                     modality="text",
                     tier_num=1,
                     explanation=f"Matched Tier 1 Implementation pattern: {pattern}"
                 )
 
-        # 6. Length heuristic: prompts with > 80 words are usually substantive implementation
+        # 6. Length heuristic: substantive implementation threshold
+        word_threshold = int(scoring_spec.get_classification_param("word_count_tier1_threshold", 80))
         words = len(last_user_content.split())
-        if words > 80:
+        if words > word_threshold:
             return CapabilityRequestVector(
                 token_count=estimated_tokens,
-                reasoning_depth=0.45,
+                reasoning_depth=p1.get("reasoning_depth", 0.45),
                 tool_calling=has_tools,
-                architecture_score=0.50,
+                architecture_score=p1.get("architecture_score", 0.50),
                 modality="text",
                 tier_num=1,
                 explanation=f"Assigned Tier 1 by length ({words} words)"
@@ -160,9 +170,9 @@ class ArbitrationSolver:
         # 7. Default routine query / tool churn (Tier 0)
         return CapabilityRequestVector(
             token_count=estimated_tokens,
-            reasoning_depth=0.20,
+            reasoning_depth=p0.get("reasoning_depth", 0.10),
             tool_calling=has_tools,
-            architecture_score=0.30,
+            architecture_score=p0.get("architecture_score", 0.20),
             modality="text",
             tier_num=0,
             explanation="Default Tier 0: Routine query or tool-churn step"
@@ -234,19 +244,14 @@ class ArbitrationSolver:
             breaker = ensure_breaker(m.provider)
             is_healthy = breaker.is_healthy()
 
-            # Dynamic fitness score tailored to compute tier:
-            if vector.tier_num == 0:
-                # Fast / tool churn: prioritize speed and low latency
-                fitness = (m.speed_score * 0.6) + (m.coding_score * 0.4)
-            elif vector.tier_num == 1:
-                # General implementation: balance coding ability and speed
-                fitness = (m.coding_score * 0.5) + (m.speed_score * 0.3) + (m.reasoning_capability * 0.2)
-            elif vector.tier_num == 2:
-                # Concurrency / deep reasoning: prioritize deep reasoning
-                fitness = (m.reasoning_capability * 0.6) + (m.coding_score * 0.4)
-            else:
-                # Tier 3 (Frontier architecture / system specs): prioritize architecture and reasoning
-                fitness = (m.architecture_score * 0.6) + (m.reasoning_capability * 0.4)
+            # Dynamic fitness score tailored to compute tier via declarative spec
+            weights = scoring_spec.get_arbitration_weights(vector.tier_num)
+            fitness = (
+                (m.speed_score * weights.get("speed", 0.0)) +
+                (m.coding_score * weights.get("coding", 0.0)) +
+                (m.reasoning_capability * weights.get("reasoning", 0.0)) +
+                (m.architecture_score * weights.get("architecture", 0.0))
+            )
 
             if m.billing_type == "subscription":
                 if is_healthy:
@@ -255,7 +260,8 @@ class ArbitrationSolver:
                 # Metered providers (e.g. OpenRouter)
                 if is_healthy:
                     # Penalize cost slightly to prefer cost-effective metered options
-                    cost_penalty = (m.input_cost_per_m + m.output_cost_per_m) / 200.0
+                    cost_divisor = scoring_spec.get_cost_penalty_divisor()
+                    cost_penalty = (m.input_cost_per_m + m.output_cost_per_m) / cost_divisor
                     eligible_metered.append((fitness - cost_penalty, m))
 
         # Sort descending by fitness, breaking ties with generation and reasoning capability
@@ -287,12 +293,12 @@ class ArbitrationSolver:
 
         # Dynamic Metered Override Threshold (Fixing Subscription Monopoly)
         # Subscriptions win for routine tasks (Tier 0/1). For complex reasoning / architecture (Tier 2/3),
-        # a metered frontier model overrides subscription if fitness delta > 0.20 (20% better).
-        FITNESS_OVERRIDE_THRESHOLD = 0.20
+        # a metered frontier model overrides subscription if fitness delta > override_threshold.
+        override_threshold = scoring_spec.get_fitness_override_threshold()
 
         metered_override = False
         if best_sub and best_metered and vector.tier_num >= 2:
-            if (best_metered[0] - best_sub[0]) > FITNESS_OVERRIDE_THRESHOLD:
+            if (best_metered[0] - best_sub[0]) > override_threshold:
                 primary_model = best_metered[1]
                 metered_override = True
             else:

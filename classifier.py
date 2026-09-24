@@ -5,6 +5,7 @@ Evaluates prompts and previous conversation turns to assign compute tiers.
 import re
 from typing import List, Dict, Any, Tuple, Optional
 from memory import check_memory, record_incident
+import scoring_spec
 
 # Regex triggers for explicit and semantic overrides
 TIER3_PATTERNS = [
@@ -35,8 +36,8 @@ TOOL_ERROR_PATTERNS = [
 
 def detect_tool_errors(messages: List[Dict[str, Any]]) -> bool:
     """Inspects recent tool or system outputs for failure signatures."""
-    # Check the last 3 messages for execution errors
-    for msg in reversed(messages[-4:]):
+    history_turns = int(scoring_spec.get_classification_param("history_check_turns", 4))
+    for msg in reversed(messages[-history_turns:]):
         content = str(msg.get("content", ""))
         for pattern in TOOL_ERROR_PATTERNS:
             if re.search(pattern, content):
@@ -76,7 +77,8 @@ def classify_request(messages: List[Dict[str, Any]]) -> Tuple[int, str]:
     # 2. System 1 Memory Check: Has a similar prompt or operational nuance failed before?
     if last_user_content:
         try:
-            mem_hit = check_memory(last_user_content, threshold=0.55)
+            mem_threshold = float(scoring_spec.get_classification_param("memory_threshold", 0.55))
+            mem_hit = check_memory(last_user_content, threshold=mem_threshold)
             if mem_hit:
                 esc_tier = mem_hit["escalated_tier"]
                 inc_id = mem_hit["incident_id"]
@@ -101,9 +103,10 @@ def classify_request(messages: List[Dict[str, Any]]) -> Tuple[int, str]:
         if re.search(pattern, last_user_content):
             return 1, f"Matched Tier 1 pattern: {pattern}"
 
-    # 5. Length heuristic: prompts with > 80 words are usually substantive implementation
+    # 5. Length heuristic: substantive implementation threshold
+    word_threshold = int(scoring_spec.get_classification_param("word_count_tier1_threshold", 80))
     words = len(last_user_content.split())
-    if words > 80:
+    if words > word_threshold:
         return 1, f"Assigned Tier 1 by length ({words} words)"
 
     # 6. Default to Tier 0 (Fast / Cheap tool churn)

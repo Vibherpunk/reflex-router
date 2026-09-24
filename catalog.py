@@ -16,6 +16,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import yaml
+import scoring_spec
 
 from config import get_key, get_opencode_go_key
 from circuit_breaker import BREAKER_REGISTRY, ProviderCircuitBreaker, BreakerState, ensure_breaker
@@ -49,15 +50,11 @@ class ReflexModelDefinition:
     tier: str = "Base"             # Architectural tier (Flagship, Mid, Flash, Mini, Rsng, Base)
 
 _SCORING_OVERLAY: List[Dict[str, Any]] = []
-_SCORING_DEFAULT: Dict[str, float] = {
-    "reasoning_capability": 0.50,
-    "architecture_score": 0.50,
-    "coding_score": 0.60,
-    "speed_score": 0.60,
-}
+_SCORING_DEFAULT: Dict[str, float] = scoring_spec.get_default_scores()
 
 def load_scoring_overlay() -> None:
     global _SCORING_OVERLAY, _SCORING_DEFAULT
+    _SCORING_DEFAULT = scoring_spec.get_default_scores()
     cfg_file = CONFIG_PROVIDERS_FILE if CONFIG_PROVIDERS_FILE.exists() else FALLBACK_PROVIDERS_FILE
     if not cfg_file.exists():
         return
@@ -102,7 +99,7 @@ def extract_model_semantics(model_id: str, metadata: Optional[Dict[str, Any]] = 
         family = "qwen"
     elif any(k in clean_id for k in ["mistral", "mixtral", "codestral"]):
         family = "mistral"
-    elif any(k in clean_id for k in ["grok"]):
+    elif any(k in clean_id for k in ["grok", "x-ai"]):
         family = "grok"
 
     # 2. Generation extraction
@@ -110,7 +107,8 @@ def extract_model_semantics(model_id: str, metadata: Optional[Dict[str, Any]] = 
     # Skip generation parsing for pure reasoning tags like r1
     if not re.search(r"\br1\b", clean_base):
         # Match X.Y or X-Y e.g., 3.7, 3-7, 3.5, 2.5, 2.0, 1.5, 4.5, 3.3, 3.1
-        m_gen = re.search(r"(?:^|[-_a-z])(?:v|version)?(\d+)[._-](\d+)", clean_base)
+        # Negative lookahead (?![bB\d]) prevents parameter counts (e.g. 8b, 70b) from being misparsed as minor versions
+        m_gen = re.search(r"(?:^|[-_a-z])(?:v|version)?(\d+)[._-](\d+)(?![bB\d])", clean_base)
         if m_gen:
             try:
                 val = float(f"{m_gen.group(1)}.{m_gen.group(2)}")
@@ -120,8 +118,9 @@ def extract_model_semantics(model_id: str, metadata: Optional[Dict[str, Any]] = 
                 pass
 
         if gen is None:
-            # Check single digit e.g. claude-3, gpt-4, llama-3, v4, v3, opus-5, o3, o1
-            m_single = re.search(r"(?:claude|gpt|llama|deepseek|qwen|mistral|gemini|opus|sonnet|haiku|o|v)[-_]?(\d+)(?![\d])", clean_base)
+            # Check single digit e.g. claude-3, gpt-4, llama-3, grok-3, v4, v3, opus-5, o3, o1
+            fam_pattern = re.escape(family) if family != "unknown" else r"[a-z]+"
+            m_single = re.search(rf"(?:{fam_pattern}|claude|gpt|llama|deepseek|qwen|mistral|gemini|grok|opus|sonnet|haiku|o|v|version)[-_]?(\d+)(?![bB\d])", clean_base)
             if m_single:
                 try:
                     val = float(m_single.group(1))
@@ -182,8 +181,7 @@ def compute_scores(semantics: Dict[str, Any]) -> Dict[str, float]:
     """
     Mathematical capability matrix:
     Base_Score = Family_Baseline + Asymptotic_Generation_Bonus + Tier_Delta + Specialization_Bonus
-    Uses asymptotic progression to prevent ceiling saturation and preserve generational differentiation
-    (e.g., Claude Opus 5.5 > Opus 5.0 > Opus 4.8 > Opus 4.1 > Sonnet 3.7 > Sonnet 3.5).
+    Driven entirely by declarative scoring_spec.yaml (Zero Hardcoded Math).
     """
     family = semantics.get("family", "unknown")
     gen = semantics.get("generation")
@@ -191,77 +189,58 @@ def compute_scores(semantics: Dict[str, Any]) -> Dict[str, float]:
     is_reasoning = semantics.get("is_reasoning", False)
     is_coder = semantics.get("is_coder", False)
 
-    # 1. Family Baselines
-    family_baselines = {
-        "claude":   {"r": 0.84, "a": 0.86, "c": 0.85, "s": 0.75},
-        "openai":   {"r": 0.82, "a": 0.84, "c": 0.84, "s": 0.75},
-        "gemini":   {"r": 0.81, "a": 0.82, "c": 0.83, "s": 0.80},
-        "deepseek": {"r": 0.82, "a": 0.81, "c": 0.82, "s": 0.75},
-        "llama":    {"r": 0.75, "a": 0.76, "c": 0.77, "s": 0.75},
-        "qwen":     {"r": 0.75, "a": 0.76, "c": 0.78, "s": 0.75},
-        "mistral":  {"r": 0.75, "a": 0.76, "c": 0.77, "s": 0.75},
-        "grok":     {"r": 0.75, "a": 0.75, "c": 0.75, "s": 0.70},
-        "unknown":  {"r": 0.60, "a": 0.60, "c": 0.65, "s": 0.65},
-    }
-    base = family_baselines.get(family, family_baselines["unknown"]).copy()
+    # 1. Family Baseline from declarative spec
+    spec_fam = scoring_spec.get_family_config(family)
+    baseline = spec_fam.get("baseline", {})
+    r = float(baseline.get("reasoning", 0.60))
+    a = float(baseline.get("architecture", 0.60))
+    c = float(baseline.get("coding", 0.65))
+    s = float(baseline.get("speed", 0.65))
 
-    # 2. Generational Asymptotic Curve
+    # 2. Generational Asymptotic Curve from declarative spec
     gen_bonus = 0.0
     if gen is not None:
-        if family == "claude":
-            delta = gen - 3.0
-            gen_bonus = 0.15 * (1.0 - math.exp(-0.45 * max(-1.0, delta)))
-        elif family == "gemini":
-            delta = gen - 1.5
-            gen_bonus = 0.15 * (1.0 - math.exp(-0.45 * max(-1.0, delta)))
-        elif family == "deepseek":
-            delta = gen - 3.0
-            gen_bonus = 0.15 * (1.0 - math.exp(-0.45 * max(-1.0, delta)))
-        elif family == "openai":
-            if gen >= 4.0:
-                delta = gen - 4.0
-                gen_bonus = 0.15 * (1.0 - math.exp(-0.45 * delta))
-            elif 1.0 < gen < 4.0:
-                gen_bonus = -0.06
+        legacy_cfg = spec_fam.get("legacy_generations")
+        if legacy_cfg and float(legacy_cfg.get("min", 0.0)) < gen < float(legacy_cfg.get("max", 0.0)):
+            gen_bonus = float(legacy_cfg.get("penalty", 0.0))
         else:
-            delta = gen - 3.0
-            gen_bonus = 0.12 * (1.0 - math.exp(-0.35 * max(-1.0, delta)))
+            anchor = float(spec_fam.get("anchor_generation", 1.0))
+            growth_rate = float(spec_fam.get("growth_rate", 0.35))
+            max_bonus = float(spec_fam.get("max_bonus", 0.15))
+            min_delta = float(spec_fam.get("min_delta", -1.0))
+            delta = max(min_delta, gen - anchor)
+            gen_bonus = max_bonus * (1.0 - math.exp(-growth_rate * delta))
 
-    r = base["r"] + gen_bonus
-    a = base["a"] + gen_bonus
-    c = base["c"] + gen_bonus
-    s = base["s"]
+    r += gen_bonus
+    a += gen_bonus
+    c += gen_bonus
 
-    # 3. Tier Weight Deltas
-    tier_deltas = {
-        "flagship": {"r": 0.05, "a": 0.06, "c": 0.04, "s": -0.15},
-        "mid":      {"r": 0.03, "a": 0.04, "c": 0.04, "s": -0.05},
-        "flash":    {"r": -0.08, "a": -0.10, "c": -0.04, "s": 0.20},
-        "reasoning":{"r": 0.08, "a": 0.05, "c": 0.05, "s": -0.15},
-        "base":     {"r": 0.00, "a": 0.00, "c": 0.00, "s": 0.00},
-    }
-    td = tier_deltas.get(tier, tier_deltas["base"])
-    r += td["r"]
-    a += td["a"]
-    c += td["c"]
-    s += td["s"]
+    # 3. Tier Weight Deltas from declarative spec
+    td = scoring_spec.get_tier_deltas(tier)
+    r += td["reasoning"]
+    a += td["architecture"]
+    c += td["coding"]
+    s += td["speed"]
 
-    # 4. Specialization Bonuses
+    # 4. Specialization Bonuses from declarative spec
+    spec_bonuses = scoring_spec.get_specialization_bonuses()
     if is_reasoning:
-        # Automatic +0.25 reasoning boost as mandated by blueprint
-        r += 0.25
-        a += 0.08
-        c += 0.06
-        s = min(s, 0.65)
+        r_spec = spec_bonuses.get("reasoning", {})
+        r += float(r_spec.get("reasoning_boost", 0.25))
+        a += float(r_spec.get("architecture_boost", 0.08))
+        c += float(r_spec.get("coding_boost", 0.06))
+        s = min(s, float(r_spec.get("max_speed", 0.65)))
 
     if is_coder:
-        c += 0.15
+        c_spec = spec_bonuses.get("coder", {})
+        c += float(c_spec.get("coding_boost", 0.15))
 
+    clamp_min, clamp_max = scoring_spec.get_clamp_bounds()
     return {
-        "reasoning_capability": round(min(0.99, max(0.10, r)), 2),
-        "architecture_score": round(min(0.99, max(0.10, a)), 2),
-        "coding_score": round(min(0.99, max(0.10, c)), 2),
-        "speed_score": round(min(0.99, max(0.10, s)), 2),
+        "reasoning_capability": round(min(clamp_max, max(clamp_min, r)), 2),
+        "architecture_score": round(min(clamp_max, max(clamp_min, a)), 2),
+        "coding_score": round(min(clamp_max, max(clamp_min, c)), 2),
+        "speed_score": round(min(clamp_max, max(clamp_min, s)), 2),
     }
 
 
