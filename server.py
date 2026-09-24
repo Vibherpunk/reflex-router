@@ -119,6 +119,13 @@ def resolve_connection(route: Dict[str, Any], payload: Dict[str, Any], session_i
         user_agent = cfg_prov.get("user_agent", user_agent)
         requires_session = cfg_prov.get("requires_session", False)
 
+    if "opencode" in prov_name.lower() or (base_url and "opencode.ai" in base_url):
+        requires_session = True
+        user_agent = "opencode/1.18.13"
+        if not api_key:
+            from config import get_opencode_go_key
+            api_key = get_opencode_go_key()
+
     if not base_url:
         raise HTTPException(status_code=502, detail=f"No upstream HTTP execution path configured for provider '{prov_name}'")
 
@@ -129,7 +136,7 @@ def resolve_connection(route: Dict[str, Any], payload: Dict[str, Any], session_i
         "Accept": "text/event-stream" if payload.get("stream") else "application/json"
     }
     if requires_session:
-        headers["x-opencode-session"] = session_id
+        headers["x-opencode-session"] = session_id or "goose-session"
     if prov_name == "openrouter":
         headers["HTTP-Referer"] = "http://127.0.0.1:8787"
         headers["X-Title"] = "Reflex-Gateway"
