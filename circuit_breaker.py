@@ -16,6 +16,30 @@ class BreakerState(str, Enum):
     OPEN = "OPEN"
     HALF_OPEN = "HALF_OPEN"
 
+BREAKER_REGISTRY: Dict[str, "ProviderCircuitBreaker"] = {}
+
+def ensure_breaker(
+    name: str,
+    base_cooldown: float = 30.0,
+    max_cooldown: float = 300.0,
+    jitter: float = 5.0,
+    canary_lease_seconds: float = 60.0,
+    **kwargs
+) -> "ProviderCircuitBreaker":
+    if name not in BREAKER_REGISTRY:
+        base = kwargs.get("base_cooldown_seconds", base_cooldown)
+        max_cd = kwargs.get("max_cooldown_seconds", max_cooldown)
+        jit = kwargs.get("jitter_seconds", jitter)
+        lease = kwargs.get("canary_lease_seconds", canary_lease_seconds)
+        BREAKER_REGISTRY[name] = ProviderCircuitBreaker(
+            name=name,
+            base_cooldown=base,
+            max_cooldown=max_cd,
+            jitter=jit,
+            canary_lease_seconds=lease
+        )
+    return BREAKER_REGISTRY[name]
+
 class ProviderCircuitBreaker:
     def __init__(
         self,
@@ -108,6 +132,10 @@ class ProviderCircuitBreaker:
                 f"Entering OPEN state for {backoff:.2f}s."
             )
             return backoff
+
+    def is_healthy(self) -> bool:
+        """Pure read, no mutation - safe to call for ranking/filtering."""
+        return self.state != BreakerState.OPEN
 
     def get_status(self) -> Dict[str, Any]:
         """Returns diagnostic telemetry for this breaker."""

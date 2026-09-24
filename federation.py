@@ -542,14 +542,16 @@ async def delegate_subagent(
     if not primary_harness or primary_harness not in installed:
         if preferred_model == "auto":
             try:
-                from classifier import classify_request
-                from config import CONFIG
-                tier_num, reason = classify_request([{"role": "user", "content": task}])
-                tier_info = CONFIG["model_tiers"][tier_num]
-                rec_model = tier_info["subscription"]["model"]
+                from catalog import ModelCatalog
+                from solver import ArbitrationSolver
+                cat = ModelCatalog()
+                solver = ArbitrationSolver(cat)
+                vector = solver.extract_vector([{"role": "user", "content": task}])
+                primary_route, _, _ = solver.arbitrate(vector, session_id=f"del-{int(time.time()*1000)}")
+                rec_model = primary_route["model"]
                 primary_harness = select_harness_for_model(rec_model, manifest)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Dynamic harness selection error: {e}")
         if not primary_harness:
             primary_harness = select_harness_for_model(preferred_model, manifest)
 

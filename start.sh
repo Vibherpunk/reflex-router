@@ -3,6 +3,10 @@
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$DIR"
 
+# Source user environment if present
+[ -f "$HOME/.env" ] && export $(grep -v '^#' "$HOME/.env" | xargs)
+[ -f "$HOME/.hermes/.env" ] && export $(grep -v '^#' "$HOME/.hermes/.env" | xargs)
+
 PORT=${PORT:-8787}
 HOST=${HOST:-127.0.0.1}
 

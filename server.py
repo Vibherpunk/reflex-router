@@ -1,56 +1,61 @@
 """
-Reflex Multi-Provider Subscription-First Gateway (v2.1.0).
-Integrated with Zero-Byte Speculative Pre-Flight, 3-State Canary Circuit Breaker,
-Contextual Prompt Classifier, SQLite Incident Memory, and CLI Harness Federation.
+Reflex Multi-Provider System 1 Router & Gateway Server.
+FastAPI ASGI proxy supporting Dynamic Capability Arbitration, Streaming SSE,
+Speculative Failover, and Non-Interactive Subagent CLI Harness Federation.
 """
 import os
+import re
 import json
 import time
-import asyncio
-import hashlib
-import logging
-from contextlib import asynccontextmanager
-from typing import Dict, Any, AsyncGenerator, Tuple, Optional
-
+import uuid
 import httpx
-from fastapi import FastAPI, Request, Response, HTTPException
+import logging
+import asyncio
+import threading
+from pathlib import Path
+from typing import Dict, Any, Tuple, Optional, AsyncGenerator, List
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request, Response, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from config import CONFIG
-from classifier import classify_request
+from config import CONFIG, get_key
 from memory import record_incident, get_stats, log_request
-from circuit_breaker import ProviderCircuitBreaker, BreakerState
+from circuit_breaker import ProviderCircuitBreaker, BreakerState, ensure_breaker, BREAKER_REGISTRY
 from federation import discover_harnesses, delegate_subagent
+from catalog import ModelCatalog, ReflexModelDefinition
+from solver import ArbitrationSolver, CapabilityRequestVector
 
 logger = logging.getLogger("reflex.server")
 logging.basicConfig(level=logging.INFO)
 
-# In-memory session tracking for KV-cache protection
-SESSION_AFFINITY: Dict[str, Dict[str, Any]] = {}
-
-# Initialize circuit breakers for subscription providers
-BREAKER_REGISTRY: Dict[str, ProviderCircuitBreaker] = {
-    name: ProviderCircuitBreaker(
-        name=name,
-        base_cooldown=CONFIG["circuit_breaker"]["base_cooldown_seconds"],
-        max_cooldown=CONFIG["circuit_breaker"]["max_cooldown_seconds"],
-        jitter=CONFIG["circuit_breaker"]["jitter_seconds"],
-        canary_lease_seconds=CONFIG["circuit_breaker"]["canary_lease_seconds"]
-    )
-    for name, p in CONFIG["providers"].items()
-    if p["type"] == "subscription"
-}
+# Global dynamic model catalog and arbitration solver
+catalog = ModelCatalog()
+solver = ArbitrationSolver(catalog)
 
 class GatewayPool:
     client: Optional[httpx.AsyncClient] = None
 
 gateway_pool = GatewayPool()
 
+def _background_catalog_refresh():
+    """Periodic worker to keep model catalog fresh every hour."""
+    while True:
+        try:
+            time.sleep(3600)
+            catalog.refresh_from_providers()
+            logger.info("Reflex background catalog refresh completed.")
+        except Exception as e:
+            logger.warning(f"Error in background catalog refresh: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     limits = httpx.Limits(max_keepalive_connections=100, max_connections=300, keepalive_expiry=60.0)
     gateway_pool.client = httpx.AsyncClient(limits=limits, timeout=httpx.Timeout(120.0, connect=15.0))
     logger.info("Reflex Gateway HTTP connection pool initialized.")
+    # Initialize catalog in background thread on startup
+    threading.Thread(target=catalog.refresh_from_providers, kwargs={"force": False}, daemon=True).start()
+    threading.Thread(target=_background_catalog_refresh, daemon=True).start()
     yield
     if gateway_pool.client:
         await gateway_pool.client.aclose()
@@ -58,25 +63,27 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Reflex System 1 Router",
-    version="2.1.0",
+    version="2.2.0",
+    description="Intelligent Multi-Provider Capability Router with Dynamic Arbitration",
     lifespan=lifespan
 )
 
-def get_session_id(payload: Dict[str, Any], headers: Any) -> str:
-    """Derives a stable session ID from headers or message prefix."""
-    if "x-opencode-session" in headers:
-        return headers["x-opencode-session"]
-
-    messages = payload.get("messages", [])
-    if messages:
-        first_content = str(messages[0].get("content", ""))[:200]
-        return "sess-" + hashlib.sha256(first_content.encode()).hexdigest()[:16]
-    return "sess-default-stream"
-
 def estimate_tokens(payload: Dict[str, Any]) -> int:
-    """Fast character-based token estimator (~3.8 chars/token)."""
+    """Fast, lightweight token count estimation based on char length."""
     total_chars = sum(len(str(m.get("content", ""))) for m in payload.get("messages", []))
-    return int((total_chars / 3.8) * 1.15)
+    return max(1, total_chars // 4)
+
+def get_session_id(payload: Dict[str, Any], headers: Any) -> str:
+    """Deterministic session extractor across OpenCode, Goose, and direct clients."""
+    if "session_id" in payload:
+        return str(payload["session_id"])
+    if "metadata" in payload and isinstance(payload["metadata"], dict) and "session_id" in payload["metadata"]:
+        return str(payload["metadata"]["session_id"])
+    if "x-opencode-session" in headers:
+        return str(headers["x-opencode-session"])
+    if "x-session-id" in headers:
+        return str(headers["x-session-id"])
+    return "session-ephemeral-default"
 
 def normalize_error(status_code: int, raw_body: bytes) -> Dict[str, Any]:
     """Ensures raw provider errors (including Cloudflare HTML proxies) format to OpenAI JSON."""
@@ -89,87 +96,110 @@ def normalize_error(status_code: int, raw_body: bytes) -> Dict[str, Any]:
         text = raw_body.decode(errors="replace")[:300].strip()
         return {"error": {"message": f"Upstream error (HTTP {status_code}): {text}", "code": status_code, "type": "upstream_error"}}
 
-def build_upstream_headers(provider_name: str, payload: Dict[str, Any], session_id: str) -> Dict[str, str]:
-    prov = CONFIG["providers"][provider_name]
+def resolve_connection(route: Dict[str, Any], payload: Dict[str, Any], session_id: str) -> Tuple[str, Dict[str, str]]:
+    """Resolves upstream execution URL and headers dynamically from catalog or config."""
+    prov_name = route["provider"]
+    model_id = route["model"]
+
+    m = catalog.get(prov_name, model_id) or catalog.get_by_id(model_id)
+    base_url = None
+    api_key = ""
+    user_agent = "reflex-gateway/2.2"
+    requires_session = False
+
+    if m and m.base_url:
+        base_url = m.base_url
+        if m.api_key_env:
+            api_key = get_key(m.api_key_env)
+
+    if prov_name in CONFIG.get("providers", {}):
+        cfg_prov = CONFIG["providers"][prov_name]
+        base_url = base_url or cfg_prov.get("base_url")
+        api_key = api_key or cfg_prov.get("api_key", "")
+        user_agent = cfg_prov.get("user_agent", user_agent)
+        requires_session = cfg_prov.get("requires_session", False)
+
+    if not base_url:
+        raise HTTPException(status_code=502, detail=f"No upstream HTTP execution path configured for provider '{prov_name}'")
+
     headers = {
-        "Authorization": f"Bearer {prov['api_key']}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "User-Agent": prov.get("user_agent", "reflex-gateway/2.0"),
+        "User-Agent": user_agent,
         "Accept": "text/event-stream" if payload.get("stream") else "application/json"
     }
-    if prov.get("requires_session"):
+    if requires_session:
         headers["x-opencode-session"] = session_id
-    if provider_name == "openrouter":
+    if prov_name == "openrouter":
         headers["HTTP-Referer"] = "http://127.0.0.1:8787"
         headers["X-Title"] = "Reflex-Gateway"
-    return headers
 
-def select_candidate_routes(payload: Dict[str, Any], session_id: str) -> Tuple[Dict[str, Any], Dict[str, Any], int, str]:
+    return f"{base_url.rstrip('/')}/chat/completions", headers
+
+def select_candidate_routes(
+    payload: Dict[str, Any],
+    session_id: str,
+    access_method: Optional[str] = "http_gateway"
+) -> Tuple[Dict[str, Any], Dict[str, Any], int, str]:
     """
-    Selects primary subscription route and metered fallback based on classification,
-    explicit model requested, and KV-cache affinity.
+    Selects primary subscription route and metered fallback based on dynamic capability arbitration.
     Returns (subscription_route, metered_route, tier_num, explanation).
     """
-    tokens = estimate_tokens(payload)
-    tier_num, reason = classify_request(payload.get("messages", []))
-    tier_info = CONFIG["model_tiers"][tier_num]
-
     requested_model = payload.get("model", "auto")
-
-    # Invariant 1: Capability Match
-    # If the user/harness explicitly demands a frontier metered model not on subscription
-    if "claude-3.7" in requested_model or "gpt-4o" in requested_model or "o3-mini" in requested_model:
-        forced_metered = {"provider": "openrouter", "model": requested_model}
-        return forced_metered, forced_metered, tier_num, f"Capability match for metered model {requested_model}"
-
-    # Invariant 4: KV-Cache Latch
-    if tokens > CONFIG["kv_cache_context_threshold"] and session_id in SESSION_AFFINITY:
-        aff = SESSION_AFFINITY[session_id]
-        locked_sub = aff.get("subscription_route", tier_info["subscription"])
-        locked_metered = aff.get("metered_route", tier_info["metered"])
-        return locked_sub, locked_metered, tier_num, f"KV-Cache Latch locked to {locked_sub['model']} ({tokens} tokens)"
-
-    sub_route = tier_info["subscription"]
-    metered_route = tier_info["metered"]
-
-    SESSION_AFFINITY[session_id] = {
-        "subscription_route": sub_route,
-        "metered_route": metered_route,
-        "last_seen": time.time()
-    }
-
-    return sub_route, metered_route, tier_num, f"Tier {tier_num} ({tier_info['name']}): {reason}"
+    messages = payload.get("messages", [])
+    vector = solver.extract_vector(messages, requested_model)
+    primary, metered, reason = solver.arbitrate(
+        vector,
+        session_id=session_id,
+        requested_model=requested_model,
+        preferred_access_method=access_method
+    )
+    return primary, metered, vector.tier_num, reason
 
 @app.get("/health")
 @app.get("/")
 async def health_check():
     providers_summary = {}
-    for name, p in CONFIG["providers"].items():
-        breaker = BREAKER_REGISTRY.get(name)
-        providers_summary[name] = {
-            "name": p["name"],
-            "type": p["type"],
-            "configured": bool(p["api_key"]),
-            "circuit_breaker": breaker.get_status() if breaker else "N/A"
-        }
+    for m in catalog.list_all():
+        if m.provider not in providers_summary:
+            breaker = ensure_breaker(m.provider)
+            providers_summary[m.provider] = {
+                "name": m.provider,
+                "type": m.billing_type,
+                "circuit_breaker": breaker.get_status()
+            }
     return {
         "status": "active",
         "service": "Reflex Multi-Provider Intelligent Gateway",
-        "version": "2.1.0",
-        "providers": providers_summary,
-        "tiers": CONFIG["model_tiers"]
+        "version": "2.2.0",
+        "catalog_size": len(catalog.list_all()),
+        "providers": providers_summary
     }
 
 @app.get("/v1/models")
 async def list_models():
-    """Returns OpenAI-compatible model listing."""
+    """Returns OpenAI-compatible model listing from dynamic catalog."""
     models_list = [
         {"id": "auto", "object": "model", "owned_by": "reflex-router", "permission": []}
     ]
-    for p_name, prov in CONFIG["providers"].items():
-        for m in prov["models"]:
-            models_list.append({"id": m, "object": "model", "owned_by": p_name})
+    for m in catalog.list_all():
+        models_list.append({
+            "id": m.id,
+            "object": "model",
+            "owned_by": m.provider,
+            "billing_type": m.billing_type,
+            "context_window": m.context_window,
+            "reasoning_capability": m.reasoning_capability,
+            "architecture_score": m.architecture_score,
+            "access_method": m.access_method
+        })
     return {"object": "list", "data": models_list}
+
+@app.post("/v1/catalog/refresh")
+async def refresh_catalog(force: bool = True):
+    """Refreshes live model catalog across all harnesses and APIs."""
+    catalog.refresh_from_providers(force=force)
+    return {"status": "refreshed", "catalog_size": len(catalog.list_all())}
 
 @app.post("/v1/feedback")
 async def submit_feedback(request: Request):
@@ -193,6 +223,7 @@ async def submit_feedback(request: Request):
 async def get_router_stats():
     stats = get_stats()
     stats["circuit_breakers"] = {name: b.get_status() for name, b in BREAKER_REGISTRY.items()}
+    stats["catalog_size"] = len(catalog.list_all())
     return stats
 
 @app.get("/v1/harnesses")
@@ -202,19 +233,30 @@ async def get_harnesses(rescan: bool = False):
 
 @app.post("/v1/route")
 async def route_preview(request: Request):
-    """Previews tier classification and provider routing without execution."""
+    """Previews dynamic capability arbitration and provider routing without execution."""
     data = await request.json()
     prompt = str(data.get("prompt", "")).strip()
     messages = data.get("messages", [{"role": "user", "content": prompt}])
-    tier_num, reason = classify_request(messages)
-    tier_info = CONFIG["model_tiers"][tier_num]
+    requested_model = data.get("model", "auto")
+    vector = solver.extract_vector(messages, requested_model)
+    primary, metered, reason = solver.arbitrate(
+        vector,
+        session_id="preview",
+        requested_model=requested_model
+    )
+    tier_names = {
+        0: "Fast / Tool Churn",
+        1: "General Implementation",
+        2: "Deep Reasoning / Concurrency / Bugfix",
+        3: "Frontier Architecture / System Specs"
+    }
     return {
         "status": "success",
-        "tier": tier_num,
-        "tier_name": tier_info["name"],
+        "tier": vector.tier_num,
+        "tier_name": tier_names.get(vector.tier_num, "Custom"),
         "reason": reason,
-        "subscription_route": tier_info["subscription"],
-        "metered_route": tier_info["metered"]
+        "subscription_route": primary,
+        "metered_route": metered
     }
 
 @app.post("/v1/delegate")
@@ -242,18 +284,30 @@ async def handle_delegation(request: Request):
     preferred_model = data.get("preferred_model", "auto")
     preferred_harness = data.get("preferred_harness")
     cwd = data.get("cwd")
-    timeout = float(data.get("timeout_sec", 120.0))
+    timeout_sec = float(data.get("timeout_sec", 120.0))
+
+    # Dynamic capability routing if preferred_model is "auto"
+    if preferred_model == "auto":
+        messages = [{"role": "user", "content": task}]
+        vector = solver.extract_vector(messages)
+        primary_route, _, _ = solver.arbitrate(vector, session_id=delegation_id)
+        preferred_model = primary_route["model"]
+        if not preferred_harness and primary_route.get("access_method") == "cli_harness":
+            m_def = catalog.get(primary_route["provider"], primary_route["model"])
+            if m_def and m_def.harness_binary:
+                preferred_harness = m_def.harness_binary
 
     result = await delegate_subagent(
         task=task,
         preferred_model=preferred_model,
         preferred_harness=preferred_harness,
         cwd=cwd,
-        timeout_sec=timeout,
+        timeout_sec=timeout_sec,
         delegation_depth=delegation_depth,
         delegation_chain=delegation_chain,
         delegation_id=delegation_id
     )
+
     return result
 
 async def preflight_and_stream(
@@ -264,17 +318,17 @@ async def preflight_and_stream(
     request: Request
 ) -> Tuple[AsyncGenerator[bytes, None], str, str, str]:
     """
-    Executes true Zero-Byte Speculative Pre-Flight:
+    Reflex Speculative Failover Protocol:
     Verifies upstream status code AND first chunk BEFORE committing downstream headers.
     """
     client = gateway_pool.client or httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0))
     sub_prov_name = sub_route["provider"]
     metered_prov_name = metered_route["provider"]
-    sub_breaker = BREAKER_REGISTRY.get(sub_prov_name)
+    sub_breaker = ensure_breaker(sub_prov_name)
 
     # 1. Evaluate Circuit Breaker for subscription
-    can_try_sub = await sub_breaker.can_attempt() if sub_breaker else False
-    if can_try_sub and CONFIG["providers"][sub_prov_name]["api_key"]:
+    can_try_sub = await sub_breaker.can_attempt()
+    if can_try_sub:
         target_route = sub_route
         fallback_route = metered_route
         route_category = "subscription_zero_marginal_cost"
@@ -286,8 +340,7 @@ async def preflight_and_stream(
     active_payload = dict(payload)
     active_payload["model"] = target_route["model"]
     prov_name = target_route["provider"]
-    upstream_url = f"{CONFIG['providers'][prov_name]['base_url']}/chat/completions"
-    headers = build_upstream_headers(prov_name, active_payload, session_id)
+    upstream_url, headers = resolve_connection(target_route, active_payload, session_id)
 
     upstream_ctx = client.stream("POST", upstream_url, headers=headers, json=active_payload)
     stream_response = await upstream_ctx.__aenter__()
@@ -317,8 +370,7 @@ async def preflight_and_stream(
         route_category = "failover_after_subscription_rate_limit"
         active_payload["model"] = target_route["model"]
         prov_name = target_route["provider"]
-        upstream_url = f"{CONFIG['providers'][prov_name]['base_url']}/chat/completions"
-        headers = build_upstream_headers(prov_name, active_payload, session_id)
+        upstream_url, headers = resolve_connection(target_route, active_payload, session_id)
 
         upstream_ctx = client.stream("POST", upstream_url, headers=headers, json=active_payload)
         stream_response = await upstream_ctx.__aenter__()
@@ -327,8 +379,6 @@ async def preflight_and_stream(
     if stream_response.status_code >= 400:
         err_bytes = await stream_response.aread()
         await upstream_ctx.__aexit__(None, None, None)
-        # A provider error on the subscription route must release the canary slot
-        # (and trip the breaker); otherwise HALF_OPEN deadlocks forever.
         if target_route["provider"] == sub_prov_name and sub_breaker:
             await sub_breaker.record_failure(stream_response.status_code)
         err_obj = normalize_error(stream_response.status_code, err_bytes)
@@ -344,8 +394,6 @@ async def preflight_and_stream(
         first_chunk = await asyncio.wait_for(aiter.__anext__(), timeout=20.0)
     except (asyncio.TimeoutError, StopAsyncIteration):
         await upstream_ctx.__aexit__(None, None, None)
-        # The canary probe never produced a byte: record the failure so the
-        # breaker does not remain parked in HALF_OPEN indefinitely.
         if target_route["provider"] == sub_prov_name and sub_breaker:
             await sub_breaker.record_failure(504)
         raise HTTPException(status_code=504, detail="Upstream gateway timed out waiting for initial chunk.")
@@ -420,37 +468,30 @@ async def chat_completions(request: Request):
         # Non-streaming implementation with pre-flight failover
         client = gateway_pool.client or httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0))
         sub_prov_name = sub_route["provider"]
-        sub_breaker = BREAKER_REGISTRY.get(sub_prov_name)
-        can_try_sub = await sub_breaker.can_attempt() if sub_breaker else False
+        sub_breaker = ensure_breaker(sub_prov_name)
+        can_try_sub = await sub_breaker.can_attempt()
 
-        target = sub_route if can_try_sub and CONFIG["providers"][sub_prov_name]["api_key"] else metered_route
+        target = sub_route if can_try_sub else metered_route
         active_payload = dict(payload)
         active_payload["model"] = target["model"]
-        p_name = target["provider"]
-        upstream_url = f"{CONFIG['providers'][p_name]['base_url']}/chat/completions"
-        headers = build_upstream_headers(p_name, active_payload, session_id)
+        upstream_url, headers = resolve_connection(target, active_payload, session_id)
 
         try:
             resp = await client.post(upstream_url, headers=headers, json=active_payload)
             if resp.status_code in (429, 502, 503, 504) and target["provider"] == sub_prov_name:
-                if sub_breaker:
-                    await sub_breaker.record_failure(resp.status_code)
+                await sub_breaker.record_failure(resp.status_code)
                 target = metered_route
                 active_payload["model"] = target["model"]
-                p_name = target["provider"]
-                upstream_url = f"{CONFIG['providers'][p_name]['base_url']}/chat/completions"
-                headers = build_upstream_headers(p_name, active_payload, session_id)
+                upstream_url, headers = resolve_connection(target, active_payload, session_id)
                 resp = await client.post(upstream_url, headers=headers, json=active_payload)
 
             if resp.status_code >= 400:
-                # Any provider error on the subscription route must release/trip the
-                # canary; otherwise the breaker can deadlock in HALF_OPEN forever.
-                if target["provider"] == sub_prov_name and sub_breaker:
+                if target["provider"] == sub_prov_name:
                     await sub_breaker.record_failure(resp.status_code)
                 err_obj = normalize_error(resp.status_code, resp.content)
                 return JSONResponse(status_code=resp.status_code, content=err_obj)
 
-            if target["provider"] == sub_prov_name and sub_breaker:
+            if target["provider"] == sub_prov_name:
                 await sub_breaker.record_success()
 
             return Response(
@@ -464,9 +505,7 @@ async def chat_completions(request: Request):
                 }
             )
         except Exception as e:
-            # Transport-level failure (timeout / connect error) on the subscription
-            # route must also release the canary slot, or HALF_OPEN deadlocks.
-            if target["provider"] == sub_prov_name and sub_breaker:
+            if target["provider"] == sub_prov_name:
                 await sub_breaker.record_failure(0)  # 0 = non-HTTP transport failure
             raise HTTPException(status_code=502, detail=f"Upstream router error: {str(e)}")
 

@@ -11,21 +11,23 @@ from typing import Dict, Any, Optional
 HOME = Path.home()
 AUTH_FILE = HOME / ".local/share/opencode/auth.json"
 HERMES_ENV_FILE = HOME / ".hermes/.env"
+GLOBAL_ENV_FILE = HOME / ".env"
 
-def _load_hermes_env() -> Dict[str, str]:
+def _load_env_files() -> Dict[str, str]:
     env_vars = {}
-    if HERMES_ENV_FILE.exists():
-        try:
-            for line in HERMES_ENV_FILE.read_text().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    env_vars[k.strip()] = v.strip().strip("'\"")
-        except Exception:
-            pass
+    for path in (GLOBAL_ENV_FILE, HERMES_ENV_FILE):
+        if path.exists():
+            try:
+                for line in path.read_text().splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env_vars[k.strip()] = v.strip().strip("'\"")
+            except Exception:
+                pass
     return env_vars
 
-HERMES_ENV = _load_hermes_env()
+HERMES_ENV = _load_env_files()
 
 def get_key(var_name: str, fallback_hermes_name: Optional[str] = None) -> str:
     """Retrieve key from env, hermes .env, or opencode auth.json."""
@@ -72,11 +74,7 @@ CONFIG: Dict[str, Any] = {
             "base_url": "https://opencode.ai/zen/go/v1",
             "api_key": get_opencode_go_key(),
             "user_agent": "opencode/1.18.13",
-            "requires_session": True,
-            "models": [
-                "deepseek-v4-flash", "glm-5.3-flash", "qwen3.7-plus",
-                "glm-5.3", "deepseek-v4-pro", "qwen3.7-max", "kimi-k3"
-            ]
+            "requires_session": True
         },
         "gemini": {
             "name": "Google Gemini",
@@ -84,10 +82,7 @@ CONFIG: Dict[str, Any] = {
             "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
             "api_key": get_key("GEMINI_API_KEY"),
             "user_agent": "reflex-gateway/2.0",
-            "requires_session": False,
-            "models": [
-                "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"
-            ]
+            "requires_session": False
         },
         "openrouter": {
             "name": "OpenRouter",
@@ -95,41 +90,7 @@ CONFIG: Dict[str, Any] = {
             "base_url": "https://openrouter.ai/api/v1",
             "api_key": get_key("OPENROUTER_API_KEY"),
             "user_agent": "reflex-gateway/2.0",
-            "requires_session": False,
-            "models": [
-                "anthropic/claude-3.7-sonnet", "deepseek/deepseek-r1",
-                "deepseek/deepseek-chat", "openai/gpt-4o", "openai/o3-mini"
-            ]
-        }
-    },
-    "model_tiers": {
-        0: {
-            "name": "Fast / Tool Churn",
-            "subscription": {"provider": "opencode-go", "model": "deepseek-v4-flash"},
-            "fallback_sub": {"provider": "opencode-go", "model": "glm-5.3-flash"},
-            "metered": {"provider": "openrouter", "model": "deepseek/deepseek-chat"},
-            "reasoning": False
-        },
-        1: {
-            "name": "General Implementation",
-            "subscription": {"provider": "opencode-go", "model": "qwen3.7-plus"},
-            "fallback_sub": {"provider": "opencode-go", "model": "glm-5.3"},
-            "metered": {"provider": "openrouter", "model": "deepseek/deepseek-chat"},
-            "reasoning": False
-        },
-        2: {
-            "name": "Deep Reasoning / Concurrency / Bugfix",
-            "subscription": {"provider": "opencode-go", "model": "deepseek-v4-pro"},
-            "fallback_sub": {"provider": "opencode-go", "model": "qwen3.7-max"},
-            "metered": {"provider": "openrouter", "model": "deepseek/deepseek-r1"},
-            "reasoning": True
-        },
-        3: {
-            "name": "Frontier Architecture / System Specs",
-            "subscription": {"provider": "opencode-go", "model": "qwen3.7-max"},
-            "fallback_sub": {"provider": "opencode-go", "model": "kimi-k3"},
-            "metered": {"provider": "openrouter", "model": "anthropic/claude-3.7-sonnet"},
-            "reasoning": True
+            "requires_session": False
         }
     }
 }

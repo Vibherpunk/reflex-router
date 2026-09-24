@@ -9,20 +9,20 @@ from memory import check_memory, record_incident
 # Regex triggers for explicit and semantic overrides
 TIER3_PATTERNS = [
     r"(?i)(?:^|\s)(--deep|#hard|#architect|#spec)(?:\s|$)",
-    r"(?i)\b(system architecture|rfc spec|database migration schema|distributed consensus|split-brain)\b",
-    r"(?i)\b(zero-downtime|formal verification|cryptographic audit|security vulnerability)\b"
+    r"(?i)\b(system architecture|architecture|rfc|specification|database migration|distributed|consensus|byzantine|split-brain)\b",
+    r"(?i)\b(zero[- ]downtime|formal verification|cryptographic audit|security vulnerability|threat model)\b"
 ]
 
 TIER2_PATTERNS = [
     r"(?i)(?:^|\s)(#think|#reason)(?:\s|$)",
-    r"(?i)\b(race condition|deadlock|concurrency bug|goroutine leak|memory leak)\b",
-    r"(?i)\b(segmentation fault|panic: runtime error|null pointer dereference)\b",
-    r"(?i)\b(dynamic programming|backtracking|np-hard|algorithmic optimization)\b"
+    r"(?i)\b(race condition|deadlock|concurrency|goroutine leak|memory leak|thread safety)\b",
+    r"(?i)\b(segmentation fault|panic|null pointer|nullpointer|core dump|stack overflow)\b",
+    r"(?i)\b(dynamic programming|backtracking|np-hard|algorithmic optimization|big-o)\b"
 ]
 
 TIER1_PATTERNS = [
-    r"(?i)\b(refactor|implement|create feature|add endpoint|unit test|write tests)\b",
-    r"(?i)\b(multi-file|component|module|service layer|controller)\b"
+    r"(?i)\b(refactor|implement|create feature|add endpoint|unit test|write tests|build component)\b",
+    r"(?i)\b(multi-file|component|module|service layer|controller|database model)\b"
 ]
 
 # Error indicators in previous tool outputs that detect "Trojan Horse" bugs
