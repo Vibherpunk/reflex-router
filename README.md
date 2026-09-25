@@ -221,3 +221,26 @@ Reflex includes an automated test suite covering classification, memory escalati
 python3 -m pytest tests/ -v
 ```
 All tests run locally in under 0.5s with zero external network dependencies.
+
+## Reflex Native Rust Architecture (reflex-router-rs)
+
+The core routing engine has been ported to native Rust using **Axum 0.7 + Tokio** and listens on **Port 8787** (Note: Port 8000 is strictly reserved for Reachy Mini hardware).
+
+### Key Architectural Upgrades
+- **Zero GIL Contention:** Moving to Rust eliminates Python Global Interpreter Lock (GIL) contention.
+- **SSE Stream Integrity:** Solves the Starlette SSE premature 200 OK bug. The Rust gateway guarantees that HTTP headers are not committed downstream until upstream provider health and stream initiation are confirmed.
+- **Strict Parsing:** Replaces fragile regex version guessing with strict Serde-driven type parsing.
+
+### Dynamic Live Provider Catalog
+The `/v1/models` endpoint leverages a Dynamic Live Provider Catalog. Models are sorted by **epoch integer timestamp descending** and dynamically filtered by requested capabilities, ensuring agents always receive the most up-to-date inference endpoints.
+
+### The Metered Override Delta Rule
+To ensure optimal performance for complex tasks (Tier 2/3), Reflex prevents "free" flat-rate subscriptions from monopolizing difficult queries. If a metered provider's fitness score outperforms the subscription provider by **`Delta_fitness >= 0.15`**, Reflex executes a **Metered Override**, routing to the metered frontier model to ensure success.
+
+### Shared Skidnir Host Gateway Topology
+Reflex is designed as the centralized host gateway for the Skidnir enclave. 
+Docker containers, Sons of Anton subagents (Friday, Leo, PostBot), and VibeHard all connect to the shared host daemon via `host.docker.internal:8787` or the Docker bridge mesh.
+This topology provides:
+- Unified host-level rate-limiting and circuit breakers.
+- Global subscription pooling.
+- Elimination of sidecar container bloat, avoiding fragmented API key distribution across separate containers.
