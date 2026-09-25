@@ -130,6 +130,7 @@ impl LiveCatalog {
                 reasoning_supported: false,
                 tier: ComputeTier::Implementation,
             });
+        // Unconditionally add opencode-go first-class models
             self.models.insert("z-ai/glm-5.3-prime".to_string(), ModelMetadata {
                 id: "z-ai/glm-5.3-prime".to_string(),
                 provider: "z-ai".to_string(),
@@ -140,5 +141,43 @@ impl LiveCatalog {
                 tier: ComputeTier::Reasoning,
             });
         }
+        
+        // Unconditionally add opencode-go first-class models
+        self.models.insert("opencode-go/glm-5.3".to_string(), ModelMetadata {
+            id: "opencode-go/glm-5.3".to_string(),
+            provider: "opencode-go".to_string(),
+            created: 1781000000,
+            context_length: 128000,
+            tools_supported: true,
+            reasoning_supported: true,
+            tier: ComputeTier::Reasoning,
+        });
+        self.models.insert("opencode-go/glm-5.3-flash".to_string(), ModelMetadata {
+            id: "opencode-go/glm-5.3-flash".to_string(),
+            provider: "opencode-go".to_string(),
+            created: 1781000000,
+            context_length: 128000,
+            tools_supported: true,
+            reasoning_supported: false,
+            tier: ComputeTier::Implementation,
+        });
+        self.models.insert("opencode-go/deepseek-v4-flash".to_string(), ModelMetadata {
+            id: "opencode-go/deepseek-v4-flash".to_string(),
+            provider: "opencode-go".to_string(),
+            created: 1781000000,
+            context_length: 128000,
+            tools_supported: true,
+            reasoning_supported: false,
+            tier: ComputeTier::Implementation,
+        });
+        self.models.insert("opencode-go/kimi-k3".to_string(), ModelMetadata {
+            id: "opencode-go/kimi-k3".to_string(),
+            provider: "opencode-go".to_string(),
+            created: 1781000000,
+            context_length: 256000,
+            tools_supported: true,
+            reasoning_supported: true,
+            tier: ComputeTier::Architecture,
+        });
     }
 }

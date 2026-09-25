@@ -23,3 +23,11 @@ This unified topology allows:
 - Complete elimination of multi-container router bloat, avoiding duplicating API keys or token limits inside every client container.
 
 <!-- Validated and comprehensively documented by Reflex Router Systems & Documentation Specialist -->
+
+### 5. Multi-Tenant Client BYOK (Bring Your Own Key) Routing
+Reflex Router provides first-class support for `opencode-go` (`https://opencode.ai/zen/go/v1`) models like `glm-5.3` and `deepseek-v4-flash`.
+It supports Multi-Tenant BYOK isolation:
+- By passing an `X-Tenant-Id` header (e.g. `harwell`, `inception`) and `Authorization: Bearer <key>`, client containers supply their own API keys.
+- Reflex Router preserves this key and forwards it upstream to the provider.
+- This ensures clients are billed directly for their corporate subscriptions ($0 agency pass-through liability).
+- If no key is provided, the router falls back to the host's default provider pool.
