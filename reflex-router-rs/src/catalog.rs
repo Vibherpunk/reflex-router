@@ -1,3 +1,7 @@
+//! Dynamic Model Catalog for reflex-router-rs.
+//! Provides zero-regex live model discovery from upstream /v1/models,
+//! fallback to ~/.vibehard/model-cache.json, and 2026 frontier defaults.
+
 use std::sync::Arc;
 use dashmap::DashMap;
 use std::time::Duration;
