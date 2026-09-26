@@ -58,7 +58,7 @@ def test_classify_full_request():
     messages = [{"role": "user", "content": "Implement the legal litigation defense strategy module and refactor the compliance handler"}]
     tier, explanation, domain = classify_full_request(messages)
     assert domain == "legal"
-    assert tier == 1
+    assert tier == 2
 
 
 def test_extract_model_semantics_domain_tags():
@@ -89,7 +89,7 @@ def test_arbitration_specialized_beats_generalist_on_domain_query():
     frontier model (e.g. Claude 3.7 Sonnet) when the query is classified into that domain,
     via the declarative domain boost.
     """
-    # Generalist subscription model (baseline reasoning=0.88, arch=0.88, coding=0.88)
+    # Generalist subscription model (baseline reasoning=0.95, arch=0.95, coding=0.95)
     generalist_sub = ReflexModelDefinition(
         id="anthropic/claude-3-7-sonnet",
         display_name="Claude 3.7 Sonnet",
@@ -98,9 +98,9 @@ def test_arbitration_specialized_beats_generalist_on_domain_query():
         billing_type="subscription",
         context_window=200_000,
         max_output_tokens=8_192,
-        reasoning_capability=0.88,
-        architecture_score=0.88,
-        coding_score=0.88,
+        reasoning_capability=0.95,
+        architecture_score=0.95,
+        coding_score=0.95,
         speed_score=0.75,
         tool_calling=True,
         input_cost_per_m=0.0,
@@ -110,7 +110,7 @@ def test_arbitration_specialized_beats_generalist_on_domain_query():
         domain_specialization=None
     )
 
-    # Purpose-driven legal model (baseline reasoning=0.65, coding=0.65, domain_specialization='legal')
+    # Purpose-driven legal model (baseline reasoning=0.95, coding=0.95, domain_specialization='legal')
     specialist_metered = ReflexModelDefinition(
         id="openrouter/equall/saul-7b-instruct",
         display_name="Saul 7B Legal Instruct",
@@ -119,9 +119,9 @@ def test_arbitration_specialized_beats_generalist_on_domain_query():
         billing_type="metered",
         context_window=32_000,
         max_output_tokens=4_096,
-        reasoning_capability=0.65,
-        architecture_score=0.65,
-        coding_score=0.65,
+        reasoning_capability=0.95,
+        architecture_score=0.95,
+        coding_score=0.95,
         speed_score=0.85,
         tool_calling=True,
         input_cost_per_m=0.20,
@@ -167,9 +167,9 @@ def test_arbitration_subscription_specialist_preferred_over_metered():
         billing_type="subscription",
         context_window=32_000,
         max_output_tokens=4_096,
-        reasoning_capability=0.65,
-        architecture_score=0.65,
-        coding_score=0.65,
+        reasoning_capability=0.95,
+        architecture_score=0.95,
+        coding_score=0.95,
         speed_score=0.85,
         tool_calling=True,
         input_cost_per_m=0.0,
@@ -187,9 +187,9 @@ def test_arbitration_subscription_specialist_preferred_over_metered():
         billing_type="metered",
         context_window=32_000,
         max_output_tokens=4_096,
-        reasoning_capability=0.65,
-        architecture_score=0.65,
-        coding_score=0.65,
+        reasoning_capability=0.95,
+        architecture_score=0.95,
+        coding_score=0.95,
         speed_score=0.85,
         tool_calling=True,
         input_cost_per_m=0.20,

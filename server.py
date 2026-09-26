@@ -246,11 +246,18 @@ async def route_preview(request: Request):
     messages = data.get("messages", [{"role": "user", "content": prompt}])
     requested_model = data.get("model", "auto")
     vector = solver.extract_vector(messages, requested_model)
-    primary, metered, reason = solver.arbitrate(
-        vector,
-        session_id="preview",
-        requested_model=requested_model
-    )
+    try:
+        primary, metered, reason = solver.arbitrate(
+            vector,
+            session_id=None,
+            requested_model=requested_model
+        )
+    except RuntimeError as e:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": str(e), "type": "service_unavailable", "code": 503}},
+            headers={"Retry-After": "30"}
+        )
     tier_names = {
         0: "Fast / Tool Churn",
         1: "General Implementation",
@@ -332,14 +339,22 @@ async def preflight_and_stream(
     sub_prov_name = sub_route["provider"]
     metered_prov_name = metered_route["provider"]
     sub_breaker = ensure_breaker(sub_prov_name)
+    metered_breaker = ensure_breaker(metered_prov_name)
 
     # 1. Evaluate Circuit Breaker for subscription
     can_try_sub = await sub_breaker.can_attempt()
     if can_try_sub:
         target_route = sub_route
-        fallback_route = metered_route
+        fallback_route = metered_route if metered_prov_name != sub_prov_name else None
         route_category = "subscription_zero_marginal_cost"
     else:
+        can_try_metered = await metered_breaker.can_attempt() if metered_prov_name != sub_prov_name else False
+        if not can_try_metered:
+            raise HTTPException(
+                status_code=503,
+                detail="All candidate providers are currently circuit-open. Load shedding active.",
+                headers={"Retry-After": "30"}
+            )
         target_route = metered_route
         fallback_route = None
         route_category = "metered_circuit_open_or_unconfigured"
@@ -367,6 +382,14 @@ async def preflight_and_stream(
         if sub_breaker:
             await sub_breaker.record_failure(stream_response.status_code, retry_after)
 
+        can_try_fallback = await metered_breaker.can_attempt()
+        if not can_try_fallback:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Subscription {sub_prov_name} failed with {stream_response.status_code} and fallback {metered_prov_name} is circuit-open.",
+                headers={"Retry-After": "30"}
+            )
+
         logger.warning(
             f"Subscription {sub_prov_name} returned HTTP {stream_response.status_code}. "
             f"Failing over cleanly to metered {metered_prov_name}."
@@ -374,6 +397,7 @@ async def preflight_and_stream(
 
         # Switch to Metered
         target_route = fallback_route
+        fallback_route = None
         route_category = "failover_after_subscription_rate_limit"
         active_payload["model"] = target_route["model"]
         prov_name = target_route["provider"]
@@ -381,19 +405,35 @@ async def preflight_and_stream(
 
         upstream_ctx = client.stream("POST", upstream_url, headers=headers, json=active_payload)
         stream_response = await upstream_ctx.__aenter__()
+    elif stream_response.status_code in (429, 502, 503, 504) and not fallback_route:
+        err_bytes = await stream_response.aread()
+        await upstream_ctx.__aexit__(None, None, None)
+        active_b = sub_breaker if target_route["provider"] == sub_prov_name else metered_breaker
+        if active_b:
+            await active_b.record_failure(stream_response.status_code)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Provider '{target_route['provider']}' returned HTTP {stream_response.status_code} and no fallback provider is available.",
+            headers={"Retry-After": "30"}
+        )
 
     # If status code >= 400 even on fallback, abort before committing stream
     if stream_response.status_code >= 400:
         err_bytes = await stream_response.aread()
         await upstream_ctx.__aexit__(None, None, None)
-        if target_route["provider"] == sub_prov_name and sub_breaker:
-            await sub_breaker.record_failure(stream_response.status_code)
+        active_b = sub_breaker if target_route["provider"] == sub_prov_name else metered_breaker
+        if active_b:
+            if stream_response.status_code in (429, 500, 502, 503, 504):
+                await active_b.record_failure(stream_response.status_code)
+            elif hasattr(active_b, "release_canary"):
+                await active_b.release_canary()
         err_obj = normalize_error(stream_response.status_code, err_bytes)
         raise HTTPException(status_code=stream_response.status_code, detail=err_obj["error"])
 
-    # If subscription succeeded, confirm breaker health
-    if target_route["provider"] == sub_prov_name and sub_breaker:
-        await sub_breaker.record_success()
+    # If request succeeded, confirm breaker health
+    active_b = sub_breaker if target_route["provider"] == sub_prov_name else metered_breaker
+    if active_b:
+        await active_b.record_success()
 
     # 3. Read First Chunk to Guarantee Stream Validity
     aiter = stream_response.aiter_bytes().__aiter__()
@@ -403,6 +443,8 @@ async def preflight_and_stream(
         await upstream_ctx.__aexit__(None, None, None)
         if target_route["provider"] == sub_prov_name and sub_breaker:
             await sub_breaker.record_failure(504)
+        elif target_route["provider"] == metered_prov_name and metered_breaker:
+            await metered_breaker.record_failure(504)
         raise HTTPException(status_code=504, detail="Upstream gateway timed out waiting for initial chunk.")
 
     # 4. Stream Generator (Headers commit ONLY after this point)
@@ -443,7 +485,21 @@ async def chat_completions(request: Request):
     payload = await request.json()
     session_id = get_session_id(payload, request.headers)
 
-    sub_route, metered_route, tier_num, explanation = select_candidate_routes(payload, session_id)
+    try:
+        sub_route, metered_route, tier_num, explanation = select_candidate_routes(payload, session_id)
+    except RuntimeError as e:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": str(e),
+                    "type": "service_unavailable",
+                    "code": 503
+                }
+            },
+            headers={"Retry-After": "30"}
+        )
+
     try:
         log_request(tier_num)
     except Exception:
@@ -475,31 +531,90 @@ async def chat_completions(request: Request):
         # Non-streaming implementation with pre-flight failover
         client = gateway_pool.client or httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0))
         sub_prov_name = sub_route["provider"]
+        metered_prov_name = metered_route["provider"]
         sub_breaker = ensure_breaker(sub_prov_name)
-        can_try_sub = await sub_breaker.can_attempt()
+        metered_breaker = ensure_breaker(metered_prov_name)
 
-        target = sub_route if can_try_sub else metered_route
+        can_try_sub = await sub_breaker.can_attempt()
+        if can_try_sub:
+            target = sub_route
+            fallback = metered_route if metered_prov_name != sub_prov_name else None
+        else:
+            can_try_metered = await metered_breaker.can_attempt() if metered_prov_name != sub_prov_name else False
+            if not can_try_metered:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": {
+                            "message": "All candidate providers are currently circuit-open. Load shedding active.",
+                            "type": "service_unavailable",
+                            "code": 503
+                        }
+                    },
+                    headers={"Retry-After": "30"}
+                )
+            target = metered_route
+            fallback = None
+
         active_payload = dict(payload)
         active_payload["model"] = target["model"]
         upstream_url, headers = resolve_connection(target, active_payload, session_id)
 
         try:
             resp = await client.post(upstream_url, headers=headers, json=active_payload)
-            if resp.status_code in (429, 502, 503, 504) and target["provider"] == sub_prov_name:
-                await sub_breaker.record_failure(resp.status_code)
-                target = metered_route
-                active_payload["model"] = target["model"]
-                upstream_url, headers = resolve_connection(target, active_payload, session_id)
-                resp = await client.post(upstream_url, headers=headers, json=active_payload)
+            if resp.status_code in (429, 502, 503, 504):
+                if target["provider"] == sub_prov_name and sub_breaker:
+                    await sub_breaker.record_failure(resp.status_code)
+                elif target["provider"] == metered_prov_name and metered_breaker:
+                    await metered_breaker.record_failure(resp.status_code)
+
+                if fallback and fallback["provider"] != target["provider"]:
+                    can_try_fallback = await metered_breaker.can_attempt()
+                    if can_try_fallback:
+                        target = fallback
+                        fallback = None
+                        active_payload["model"] = target["model"]
+                        upstream_url, headers = resolve_connection(target, active_payload, session_id)
+                        resp = await client.post(upstream_url, headers=headers, json=active_payload)
+                    else:
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "error": {
+                                    "message": f"Provider '{sub_prov_name}' failed with {resp.status_code} and fallback '{metered_prov_name}' is circuit-open.",
+                                    "type": "service_unavailable",
+                                    "code": 503
+                                }
+                            },
+                            headers={"Retry-After": "30"}
+                        )
+                else:
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "error": {
+                                "message": f"Provider '{target['provider']}' returned HTTP {resp.status_code} and no healthy distinct fallback is available.",
+                                "type": "service_unavailable",
+                                "code": 503
+                            }
+                        },
+                        headers={"Retry-After": "30"}
+                    )
 
             if resp.status_code >= 400:
-                if target["provider"] == sub_prov_name:
-                    await sub_breaker.record_failure(resp.status_code)
+                active_b = sub_breaker if target["provider"] == sub_prov_name else metered_breaker
+                if active_b:
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        await active_b.record_failure(resp.status_code)
+                    elif hasattr(active_b, "release_canary"):
+                        await active_b.release_canary()
                 err_obj = normalize_error(resp.status_code, resp.content)
                 return JSONResponse(status_code=resp.status_code, content=err_obj)
 
-            if target["provider"] == sub_prov_name:
+            if target["provider"] == sub_prov_name and sub_breaker:
                 await sub_breaker.record_success()
+            elif target["provider"] == metered_prov_name and metered_breaker:
+                await metered_breaker.record_success()
 
             return Response(
                 content=resp.content,
@@ -512,8 +627,12 @@ async def chat_completions(request: Request):
                 }
             )
         except Exception as e:
-            if target["provider"] == sub_prov_name:
+            if isinstance(e, HTTPException):
+                raise e
+            if target["provider"] == sub_prov_name and sub_breaker:
                 await sub_breaker.record_failure(0)  # 0 = non-HTTP transport failure
+            elif target["provider"] == metered_prov_name and metered_breaker:
+                await metered_breaker.record_failure(0)
             raise HTTPException(status_code=502, detail=f"Upstream router error: {str(e)}")
 
 if __name__ == "__main__":

@@ -9,9 +9,9 @@ import time
 import threading
 from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
-from catalog import ReflexModelDefinition, ModelCatalog
+from catalog import ReflexModelDefinition, ModelCatalog, resolve_model_alias
 from circuit_breaker import BREAKER_REGISTRY, ensure_breaker
-from classifier import detect_tool_errors, classify_domain, TIER3_PATTERNS, TIER2_PATTERNS, TIER1_PATTERNS
+from classifier import detect_tool_errors, classify_domain, TIER3_PATTERNS, TIER2_PATTERNS, TIER1_PATTERNS, PROTECTED_DOMAINS
 from memory import check_memory, record_incident
 import scoring_spec
 
@@ -147,7 +147,31 @@ class ArbitrationSolver:
                     domain=detected_domain
                 )
 
-        # 5. General Implementation / Feature patterns (Tier 1)
+        # 5. Domain Promotion Floor: legal, finance, accounting, compliance, security -> min Tier 2 (or Tier 3 if high blast radius)
+        if detected_domain in PROTECTED_DOMAINS:
+            if re.search(r"(?i)\bblast[- ]radius\b", last_user_content):
+                return CapabilityRequestVector(
+                    token_count=estimated_tokens,
+                    reasoning_depth=p3.get("reasoning_depth", 0.95),
+                    tool_calling=has_tools,
+                    architecture_score=p3.get("architecture_score", 0.95),
+                    modality="text",
+                    tier_num=3,
+                    explanation=f"Domain hard floor (Tier 3 - high blast radius) enforced for '{detected_domain}'",
+                    domain=detected_domain
+                )
+            return CapabilityRequestVector(
+                token_count=estimated_tokens,
+                reasoning_depth=p2.get("reasoning_depth", 0.90),
+                tool_calling=has_tools,
+                architecture_score=p2.get("architecture_score", 0.75),
+                modality="text",
+                tier_num=2,
+                explanation=f"Domain hard floor (Tier 2) enforced for '{detected_domain}'",
+                domain=detected_domain
+            )
+
+        # 6. General Implementation / Feature patterns (Tier 1)
         for pattern in TIER1_PATTERNS:
             if re.search(pattern, last_user_content):
                 return CapabilityRequestVector(
@@ -191,14 +215,14 @@ class ArbitrationSolver:
     def arbitrate(
         self,
         vector: CapabilityRequestVector,
-        session_id: str,
+        session_id: Optional[str] = None,
         requested_model: str = "auto",
         preferred_access_method: Optional[str] = None
     ) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
         """
         Arbitrates requests across dynamically discovered models:
-        1. Exact requested_model match if explicitly specified.
-        2. KV-cache latching if tokens > 20,000 and previous primary is healthy.
+        1. Exact requested_model match if explicitly specified (with alias normalization).
+        2. KV-cache latching if tokens > 20,000 and previous primary is healthy and meets capability depth.
         3. Prioritizes zero-marginal-cost subscriptions matching required capability.
         4. Selects optimal metered fallback (with circuit breaker check).
         Returns: (primary_route, metered_fallback_route, explanation)
@@ -209,11 +233,17 @@ class ArbitrationSolver:
 
         # 1. Handle explicit model request (Exact match or canonical alias)
         if requested_model and requested_model != "auto":
-            # Match exact model ID
-            matches = [m for m in models if m.id == requested_model]
+            normalized_req = resolve_model_alias(requested_model)
+            # Match exact model ID or normalized alias
+            matches = [m for m in models if m.id == requested_model or m.id == normalized_req]
             if not matches:
                 # Try matching by display_name or provider/model syntax
-                matches = [m for m in models if f"{m.provider}/{m.id}" == requested_model or m.display_name.lower() == requested_model.lower()]
+                matches = [
+                    m for m in models
+                    if f"{m.provider}/{m.id}" in (requested_model, normalized_req)
+                    or m.display_name.lower() in (requested_model.lower(), normalized_req.lower())
+                    or m.id.lower() in (requested_model.lower(), normalized_req.lower())
+                ]
             if matches:
                 chosen = matches[0]
                 route = {
@@ -227,19 +257,25 @@ class ArbitrationSolver:
                 raise ValueError(f"Requested model '{requested_model}' not found in active model catalog")
 
         # 2. KV-Cache Context Latching (> 20,000 tokens)
-        if vector.token_count > 20_000:
+        if session_id and vector.token_count > 20_000:
             with self._affinity_lock:
                 if session_id in self.session_affinity:
                     latched = self.session_affinity[session_id]
+                    primary_def = self.catalog.get(latched["primary"]["provider"], latched["primary"]["model"]) or self.catalog.get_by_id(latched["primary"]["model"])
+                    meets_capability = (
+                        primary_def is not None and
+                        primary_def.reasoning_capability >= vector.reasoning_depth and
+                        primary_def.architecture_score >= vector.architecture_score
+                    )
                     breaker = ensure_breaker(latched["primary"]["provider"])
-                    if breaker.is_healthy():
+                    if meets_capability and breaker.is_healthy():
                         return (
                             latched["primary"],
                             latched["fallback"],
                             f"KV-Cache Latch locked to {latched['primary']['model']} ({vector.token_count} tokens)"
                         )
 
-        # 3. Filter candidates by context length, tool support, access method, and circuit health
+        # 3. Filter candidates by context length, tool support, access method, hard feasibility gate, and circuit health
         eligible_sub: List[Tuple[float, ReflexModelDefinition]] = []
         eligible_metered: List[Tuple[float, ReflexModelDefinition]] = []
 
@@ -250,6 +286,17 @@ class ArbitrationSolver:
                 continue
             if preferred_access_method and m.access_method != preferred_access_method:
                 continue
+
+            # Hard feasibility gate: capability depth and architecture score (P1-2)
+            if m.reasoning_capability < vector.reasoning_depth:
+                continue
+            if m.architecture_score < vector.architecture_score:
+                continue
+
+            # Domain hard floor: legal, finance, accounting, compliance, security forbidden from Tier 0 Flash models
+            if vector.domain in PROTECTED_DOMAINS:
+                if m.tier.lower() == "flash" or "flash" in m.id.lower():
+                    continue
 
             breaker = ensure_breaker(m.provider)
             is_healthy = breaker.is_healthy()
@@ -289,26 +336,22 @@ class ArbitrationSolver:
                 if m.context_window >= vector.token_count and ensure_breaker(m.provider).is_healthy()
             ]
             if healthy_emergency:
-                best = max(healthy_emergency, key=lambda x: x.reasoning_capability)
+                best = max(healthy_emergency, key=lambda x: (x.reasoning_capability, x.architecture_score))
+                route = {
+                    "provider": best.provider,
+                    "model": best.id,
+                    "access_method": best.access_method,
+                    "billing_type": best.billing_type
+                }
+                return route, route, f"Emergency fallback: selected {best.id} ({best.provider})"
             else:
-                best = max(models, key=lambda x: x.context_window)
-
-            route = {
-                "provider": best.provider,
-                "model": best.id,
-                "access_method": best.access_method,
-                "billing_type": best.billing_type
-            }
-            return route, route, f"Emergency fallback: selected {best.id} ({best.provider})"
+                # All candidate providers are circuit-open!
+                raise RuntimeError("All candidate providers are circuit-open. Load shedding active.")
 
         # 5. Route selection with Dynamic Metered Override
         best_sub = eligible_sub[0] if eligible_sub else None
         best_metered = eligible_metered[0] if eligible_metered else None
 
-        # Dynamic Metered Override Threshold (Fixing Subscription Monopoly)
-        # Subscriptions win for routine tasks (Tier 0/1). For complex reasoning / architecture (Tier 2/3),
-        # a metered frontier model overrides subscription if fitness delta > override_threshold.
-        # Purpose-driven domain models override generalists if fitness delta > domain_override_threshold.
         override_threshold = scoring_spec.get_fitness_override_threshold()
         domain_override_threshold = scoring_spec.get_domain_override_threshold()
 
@@ -337,7 +380,12 @@ class ArbitrationSolver:
         else:
             primary_model = eligible_metered[0][1] if eligible_metered else eligible_sub[0][1]
 
-        fallback_model = eligible_metered[0][1] if eligible_metered else primary_model
+        # Select distinct metered fallback when possible to avoid same-provider retry loops
+        if eligible_metered:
+            distinct_metered = [m for _, m in eligible_metered if m.provider != primary_model.provider]
+            fallback_model = distinct_metered[0] if distinct_metered else eligible_metered[0][1]
+        else:
+            fallback_model = primary_model
 
         primary_route = {
             "provider": primary_model.provider,
@@ -352,13 +400,14 @@ class ArbitrationSolver:
             "billing_type": fallback_model.billing_type
         }
 
-        # Store session affinity safely
-        with self._affinity_lock:
-            self.session_affinity[session_id] = {
-                "primary": primary_route,
-                "fallback": metered_route,
-                "last_used": time.time()
-            }
+        # Store session affinity safely (only if session_id is provided)
+        if session_id:
+            with self._affinity_lock:
+                self.session_affinity[session_id] = {
+                    "primary": primary_route,
+                    "fallback": metered_route,
+                    "last_used": time.time()
+                }
 
         if domain_override:
             primary_label = f"Primary Metered: {primary_model.id} ({primary_model.provider})"

@@ -227,11 +227,16 @@ def test_solver_kv_cache_latching(tmp_path):
     pri1, _, _ = solver.arbitrate(v_small, session_id=sess)
     assert pri1["model"] == "model-a"
 
-    # Now simulate >20,000 tokens in same session
-    v_huge = CapabilityRequestVector(token_count=25000, reasoning_depth=0.9, tool_calling=False, architecture_score=0.9, modality="text", tier_num=3, explanation="huge")
+    # Now simulate >20,000 tokens in same session with matching capability depth (latches to model-a)
+    v_huge = CapabilityRequestVector(token_count=25000, reasoning_depth=0.7, tool_calling=False, architecture_score=0.7, modality="text", tier_num=1, explanation="huge")
     pri2, _, reason2 = solver.arbitrate(v_huge, session_id=sess)
     assert pri2["model"] == "model-a"
     assert "KV-Cache Latch locked" in reason2
+
+    # Now simulate >20,000 tokens requiring deeper capability than model-a (P1-1: latch bypassed)
+    v_huge_frontier = CapabilityRequestVector(token_count=25000, reasoning_depth=0.9, tool_calling=False, architecture_score=0.9, modality="text", tier_num=3, explanation="huge frontier")
+    pri3, _, reason3 = solver.arbitrate(v_huge_frontier, session_id=sess)
+    assert pri3["model"] == "model-b"
 
 def test_solver_explicit_model_validation(tmp_path):
     db_path = tmp_path / "test_catalog.db"
@@ -266,7 +271,7 @@ def test_solver_dynamic_metered_override(tmp_path):
     db_path = tmp_path / "test_override_catalog.db"
     cat = ModelCatalog(db_path=db_path)
 
-    # Mediocre subscription model (fitness on Tier 3: 0.50 * 0.6 + 0.50 * 0.4 = 0.50)
+    # Subscription model meeting Tier 2 threshold
     sub_model = ReflexModelDefinition(
         id="mediocre-sub", display_name="Mediocre Sub", provider="sub-provider",
         access_method="http_gateway", billing_type="subscription",
@@ -275,7 +280,7 @@ def test_solver_dynamic_metered_override(tmp_path):
         tool_calling=True, input_cost_per_m=0.0, output_cost_per_m=0.0, last_updated=1000.0
     )
 
-    # Elite frontier metered model (fitness on Tier 3: 0.98 * 0.6 + 0.98 * 0.4 - cost penalty = 0.98 - 0.05 = 0.93)
+    # Elite frontier metered model
     metered_frontier = ReflexModelDefinition(
         id="frontier-metered", display_name="Frontier Metered", provider="metered-provider",
         access_method="http_gateway", billing_type="metered",
@@ -295,15 +300,15 @@ def test_solver_dynamic_metered_override(tmp_path):
     assert pri_t1["provider"] == "sub-provider"
     assert pri_t1["billing_type"] == "subscription"
 
-    # 2. Tier 3 architectural spec task: Metered model SHOULD OVERRIDE (>20% delta)
-    vec_t3 = CapabilityRequestVector(
-        token_count=500, reasoning_depth=0.95, tool_calling=False,
-        architecture_score=0.95, modality="text", tier_num=3, explanation="Frontier RFC Architecture"
+    # 2. Tier 2 deep reasoning task: Metered model SHOULD OVERRIDE (>20% delta)
+    vec_t2 = CapabilityRequestVector(
+        token_count=500, reasoning_depth=0.50, tool_calling=False,
+        architecture_score=0.50, modality="text", tier_num=2, explanation="Deep reasoning bugfix"
     )
-    pri_t3, met_t3, reason_t3 = solver.arbitrate(vec_t3, session_id="sess-t3")
-    assert pri_t3["provider"] == "metered-provider"
-    assert pri_t3["billing_type"] == "metered"
-    assert "Metered override due to high capability delta" in reason_t3
+    pri_t2, met_t2, reason_t2 = solver.arbitrate(vec_t2, session_id="sess-t2")
+    assert pri_t2["provider"] == "metered-provider"
+    assert pri_t2["billing_type"] == "metered"
+    assert "Metered override due to high capability delta" in reason_t2
 
 
 def test_reflex_cli_catalog_audit(capsys):

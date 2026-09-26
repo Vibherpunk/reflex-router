@@ -26,6 +26,28 @@ CATALOG_DB = REFLEX_DIR / "catalog.db"
 CONFIG_PROVIDERS_FILE = REFLEX_DIR / "providers.yaml"
 FALLBACK_PROVIDERS_FILE = Path(__file__).parent / "providers.yaml"
 
+MODEL_ALIASES: Dict[str, str] = {
+    "claude-3.7-sonnet": "claude-sonnet-5",
+    "claude-3-7-sonnet": "claude-sonnet-5",
+    "anthropic/claude-3.7-sonnet": "claude-sonnet-5",
+    "gemini-2.0-flash": "gemini-2.5-flash",
+    "gemini-2-0-flash": "gemini-2.5-flash",
+    "google/gemini-2.0-flash": "gemini-2.5-flash",
+}
+
+def resolve_model_alias(model_id: str) -> str:
+    """Normalizes model aliases and deprecated identifiers to active canonical IDs."""
+    if not model_id:
+        return model_id
+    mid = model_id.strip()
+    mid_lower = mid.lower()
+    if mid_lower in MODEL_ALIASES:
+        return MODEL_ALIASES[mid_lower]
+    clean_id = mid_lower.split("/")[-1]
+    if clean_id in MODEL_ALIASES:
+        return MODEL_ALIASES[clean_id]
+    return mid
+
 @dataclass
 class ReflexModelDefinition:
     id: str                        # Full model identifier (e.g. "anthropic/claude-sonnet-5", "deepseek-v4-pro")
@@ -382,12 +404,25 @@ class ModelCatalog:
         for m in self._memory_cache.values():
             if m.id == model_id and m.provider == provider:
                 return m
+        norm_id = resolve_model_alias(model_id)
+        if norm_id != model_id:
+            key_norm = f"{provider}::{norm_id}"
+            if key_norm in self._memory_cache:
+                return self._memory_cache[key_norm]
+            for m in self._memory_cache.values():
+                if m.id == norm_id and m.provider == provider:
+                    return m
         return None
 
     def get_by_id(self, model_id: str) -> Optional[ReflexModelDefinition]:
         for m in self._memory_cache.values():
             if m.id == model_id:
                 return m
+        norm_id = resolve_model_alias(model_id)
+        if norm_id != model_id:
+            for m in self._memory_cache.values():
+                if m.id == norm_id:
+                    return m
         return None
 
     def upsert_models(self, models: List[ReflexModelDefinition]):

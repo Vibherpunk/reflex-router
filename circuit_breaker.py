@@ -111,6 +111,12 @@ class ProviderCircuitBreaker:
             self.canary_in_flight = False
             self.canary_granted_at = 0.0
 
+    async def release_canary(self) -> None:
+        """Releases an in-flight canary slot without tripping breaker or resetting failures."""
+        async with self._lock:
+            self.canary_in_flight = False
+            self.canary_granted_at = 0.0
+
     async def record_failure(self, status_code: int, retry_after: Optional[float] = None) -> float:
         """Trips breaker with exponential backoff and randomized jitter."""
         async with self._lock:

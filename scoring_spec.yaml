@@ -211,6 +211,10 @@ domain_specializations:
       - "jurisdiction"
       - "tort"
       - "contract law"
+      - "contract"
+      - "nondisclosure"
+      - "nda"
+      - "liability"
       - "litigation"
       - "master services agreement"
       - "msa"
@@ -287,4 +291,56 @@ domain_specializations:
       - "numina"
       - "llemma"
       - "mathstral"
+  accounting:
+    boost: 0.30
+    keywords:
+      - "accounting"
+      - "bookkeeping"
+      - "general ledger"
+      - "ledger"
+      - "payroll"
+      - "erdc"
+      - "gaap"
+      - "reconciliation"
+      - "reconcile"
+      - "double-entry"
+      - "invoicing"
+      - "accounts payable"
+      - "accounts receivable"
+    model_tags:
+      - "fin"
+      - "finance"
+      - "accounting"
+  compliance:
+    boost: 0.35
+    keywords:
+      - "compliance"
+      - "regulatory"
+      - "audit"
+      - "sox"
+      - "hipaa"
+      - "gdpr"
+      - "naic"
+      - "delc"
+      - "statutory"
+      - "oar 414"
+      - "subpoena"
+    model_tags:
+      - "legal"
+      - "compliance"
+  security:
+    boost: 0.35
+    keywords:
+      - "security"
+      - "vulnerability"
+      - "cve"
+      - "penetration testing"
+      - "infosec"
+      - "threat model"
+      - "blast radius"
+      - "cryptographic audit"
+      - "soc 2"
+    model_tags:
+      - "sec"
+      - "security"
 
