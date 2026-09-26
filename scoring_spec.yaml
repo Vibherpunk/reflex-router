@@ -160,6 +160,19 @@ arbitration:
   domain_override_threshold: 0.0
   cost_penalty_divisor: 200.0
 
+  tier_effort_mapping:
+    tier_0: "none"
+    tier_1: "low"
+    tier_2: "medium"
+    tier_3: "high"
+
+  effort_thinking_budgets:
+    none: 0
+    low: 2048
+    medium: 8192
+    high: 32768
+    max: 65536
+
   tier_fitness_weights:
     tier_0:
       speed: 0.6

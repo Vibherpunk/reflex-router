@@ -25,6 +25,7 @@ class CapabilityRequestVector:
     tier_num: int                  # Equivalent tier (0-3) for telemetry
     explanation: str               # Human-readable rationale
     domain: Optional[str] = None   # Domain specialization (legal, medical, finance, math, etc.)
+    effort: str = "low"            # Dynamic reasoning effort ("none", "low", "medium", "high", "max")
 
 class ArbitrationSolver:
     def __init__(self, catalog: ModelCatalog):
@@ -48,7 +49,8 @@ class ArbitrationSolver:
                 modality="text",
                 tier_num=0,
                 explanation="Empty request default",
-                domain=None
+                domain=None,
+                effort=scoring_spec.get_tier_effort(0)
             )
 
         detected_domain = classify_domain(messages)
@@ -69,6 +71,31 @@ class ArbitrationSolver:
                 has_tools = True
                 break
 
+        def build_vector(
+            tier_num: int,
+            reasoning_depth: float,
+            architecture_score: float,
+            explanation: str
+        ) -> CapabilityRequestVector:
+            effort = scoring_spec.get_tier_effort(tier_num)
+            prompt_lower = last_user_content.lower()
+            if "#think" in prompt_lower or "#reason" in prompt_lower:
+                if effort in ("none", "low"):
+                    effort = "medium"
+            if any(k in prompt_lower for k in ["#spec", "#architect", "--deep"]):
+                effort = "high"
+            return CapabilityRequestVector(
+                token_count=estimated_tokens,
+                reasoning_depth=reasoning_depth,
+                tool_calling=has_tools,
+                architecture_score=architecture_score,
+                modality="text",
+                tier_num=tier_num,
+                explanation=explanation,
+                domain=detected_domain,
+                effort=effort
+            )
+
         # 1. Trojan Horse Check: Preceding tool failures
         has_execution_error = detect_tool_errors(messages)
         if has_execution_error:
@@ -82,15 +109,11 @@ class ArbitrationSolver:
                     )
                 except Exception:
                     pass
-            return CapabilityRequestVector(
-                token_count=estimated_tokens,
-                reasoning_depth=p2.get("reasoning_depth", 0.90),
-                tool_calling=has_tools,
-                architecture_score=p2.get("architecture_score", 0.75),
-                modality="text",
+            return build_vector(
                 tier_num=2,
-                explanation="Escalated to Tier 2: Detected test/compiler error in prior execution",
-                domain=detected_domain
+                reasoning_depth=p2.get("reasoning_depth", 0.90),
+                architecture_score=p2.get("architecture_score", 0.75),
+                explanation="Escalated to Tier 2: Detected test/compiler error in prior execution"
             )
 
         # 2. System 1 Memory Check: Learned incidents
@@ -106,15 +129,11 @@ class ArbitrationSolver:
                     esc_defaults = scoring_spec.get_memory_escalation_defaults(esc_tier)
                     r_depth = esc_defaults.get("reasoning_depth", 0.95 if esc_tier >= 2 else 0.60)
                     a_score = esc_defaults.get("architecture_score", 0.95 if esc_tier == 3 else 0.70)
-                    return CapabilityRequestVector(
-                        token_count=estimated_tokens,
-                        reasoning_depth=r_depth,
-                        tool_calling=has_tools,
-                        architecture_score=a_score,
-                        modality="text",
+                    return build_vector(
                         tier_num=esc_tier,
-                        explanation=f"Memory Auto-Escalation (Incident #{inc_id}, sim={sim}): learned from prior failure in '{sample_snippet}'",
-                        domain=detected_domain
+                        reasoning_depth=r_depth,
+                        architecture_score=a_score,
+                        explanation=f"Memory Auto-Escalation (Incident #{inc_id}, sim={sim}): learned from prior failure in '{sample_snippet}'"
                     )
             except Exception:
                 pass
@@ -122,94 +141,66 @@ class ArbitrationSolver:
         # 3. Frontier Architecture patterns (Tier 3)
         for pattern in TIER3_PATTERNS:
             if re.search(pattern, last_user_content):
-                return CapabilityRequestVector(
-                    token_count=estimated_tokens,
-                    reasoning_depth=p3.get("reasoning_depth", 0.95),
-                    tool_calling=has_tools,
-                    architecture_score=p3.get("architecture_score", 0.95),
-                    modality="text",
+                return build_vector(
                     tier_num=3,
-                    explanation=f"Matched Tier 3 Architecture pattern: {pattern}",
-                    domain=detected_domain
+                    reasoning_depth=p3.get("reasoning_depth", 0.95),
+                    architecture_score=p3.get("architecture_score", 0.95),
+                    explanation=f"Matched Tier 3 Architecture pattern: {pattern}"
                 )
 
         # 4. Deep Reasoning / Concurrency patterns (Tier 2)
         for pattern in TIER2_PATTERNS:
             if re.search(pattern, last_user_content):
-                return CapabilityRequestVector(
-                    token_count=estimated_tokens,
-                    reasoning_depth=p2.get("reasoning_depth", 0.90),
-                    tool_calling=has_tools,
-                    architecture_score=p2.get("architecture_score", 0.75),
-                    modality="text",
+                return build_vector(
                     tier_num=2,
-                    explanation=f"Matched Tier 2 Concurrency pattern: {pattern}",
-                    domain=detected_domain
+                    reasoning_depth=p2.get("reasoning_depth", 0.90),
+                    architecture_score=p2.get("architecture_score", 0.75),
+                    explanation=f"Matched Tier 2 Concurrency pattern: {pattern}"
                 )
 
         # 5. Domain Promotion Floor: legal, finance, accounting, compliance, security -> min Tier 2 (or Tier 3 if high blast radius)
         if detected_domain in PROTECTED_DOMAINS:
             if re.search(r"(?i)\bblast[- ]radius\b", last_user_content):
-                return CapabilityRequestVector(
-                    token_count=estimated_tokens,
-                    reasoning_depth=p3.get("reasoning_depth", 0.95),
-                    tool_calling=has_tools,
-                    architecture_score=p3.get("architecture_score", 0.95),
-                    modality="text",
+                return build_vector(
                     tier_num=3,
-                    explanation=f"Domain hard floor (Tier 3 - high blast radius) enforced for '{detected_domain}'",
-                    domain=detected_domain
+                    reasoning_depth=p3.get("reasoning_depth", 0.95),
+                    architecture_score=p3.get("architecture_score", 0.95),
+                    explanation=f"Domain hard floor (Tier 3 - high blast radius) enforced for '{detected_domain}'"
                 )
-            return CapabilityRequestVector(
-                token_count=estimated_tokens,
-                reasoning_depth=p2.get("reasoning_depth", 0.90),
-                tool_calling=has_tools,
-                architecture_score=p2.get("architecture_score", 0.75),
-                modality="text",
+            return build_vector(
                 tier_num=2,
-                explanation=f"Domain hard floor (Tier 2) enforced for '{detected_domain}'",
-                domain=detected_domain
+                reasoning_depth=p2.get("reasoning_depth", 0.90),
+                architecture_score=p2.get("architecture_score", 0.75),
+                explanation=f"Domain hard floor (Tier 2) enforced for '{detected_domain}'"
             )
 
         # 6. General Implementation / Feature patterns (Tier 1)
         for pattern in TIER1_PATTERNS:
             if re.search(pattern, last_user_content):
-                return CapabilityRequestVector(
-                    token_count=estimated_tokens,
-                    reasoning_depth=p1.get("reasoning_depth", 0.45),
-                    tool_calling=has_tools,
-                    architecture_score=p1.get("architecture_score", 0.50),
-                    modality="text",
+                return build_vector(
                     tier_num=1,
-                    explanation=f"Matched Tier 1 Implementation pattern: {pattern}",
-                    domain=detected_domain
+                    reasoning_depth=p1.get("reasoning_depth", 0.45),
+                    architecture_score=p1.get("architecture_score", 0.50),
+                    explanation=f"Matched Tier 1 Implementation pattern: {pattern}"
                 )
 
         # 6. Length heuristic: substantive implementation threshold
         word_threshold = int(scoring_spec.get_classification_param("word_count_tier1_threshold", 80))
         words = len(last_user_content.split())
         if words > word_threshold:
-            return CapabilityRequestVector(
-                token_count=estimated_tokens,
-                reasoning_depth=p1.get("reasoning_depth", 0.45),
-                tool_calling=has_tools,
-                architecture_score=p1.get("architecture_score", 0.50),
-                modality="text",
+            return build_vector(
                 tier_num=1,
-                explanation=f"Assigned Tier 1 by length ({words} words)",
-                domain=detected_domain
+                reasoning_depth=p1.get("reasoning_depth", 0.45),
+                architecture_score=p1.get("architecture_score", 0.50),
+                explanation=f"Assigned Tier 1 by length ({words} words)"
             )
 
         # 7. Default routine query / tool churn (Tier 0)
-        return CapabilityRequestVector(
-            token_count=estimated_tokens,
-            reasoning_depth=p0.get("reasoning_depth", 0.10),
-            tool_calling=has_tools,
-            architecture_score=p0.get("architecture_score", 0.20),
-            modality="text",
+        return build_vector(
             tier_num=0,
-            explanation="Default Tier 0: Routine query or tool-churn step",
-            domain=detected_domain
+            reasoning_depth=p0.get("reasoning_depth", 0.10),
+            architecture_score=p0.get("architecture_score", 0.20),
+            explanation="Default Tier 0: Routine query or tool-churn step"
         )
 
     def arbitrate(
@@ -250,9 +241,10 @@ class ArbitrationSolver:
                     "provider": chosen.provider,
                     "model": chosen.id,
                     "access_method": chosen.access_method,
-                    "billing_type": chosen.billing_type
+                    "billing_type": chosen.billing_type,
+                    "effort": vector.effort
                 }
-                return route, route, f"Explicit model override: {chosen.id} ({chosen.provider})"
+                return route, route, f"Explicit model override: {chosen.id} ({chosen.provider}) [Effort={vector.effort}]"
             else:
                 raise ValueError(f"Requested model '{requested_model}' not found in active model catalog")
 
@@ -269,10 +261,14 @@ class ArbitrationSolver:
                     )
                     breaker = ensure_breaker(latched["primary"]["provider"])
                     if meets_capability and breaker.is_healthy():
+                        pri_latched = dict(latched["primary"])
+                        pri_latched["effort"] = vector.effort
+                        fall_latched = dict(latched["fallback"])
+                        fall_latched["effort"] = vector.effort
                         return (
-                            latched["primary"],
-                            latched["fallback"],
-                            f"KV-Cache Latch locked to {latched['primary']['model']} ({vector.token_count} tokens)"
+                            pri_latched,
+                            fall_latched,
+                            f"KV-Cache Latch locked to {latched['primary']['model']} ({vector.token_count} tokens) [Effort={vector.effort}]"
                         )
 
         # 3. Filter candidates by context length, tool support, access method, hard feasibility gate, and circuit health
@@ -341,9 +337,10 @@ class ArbitrationSolver:
                     "provider": best.provider,
                     "model": best.id,
                     "access_method": best.access_method,
-                    "billing_type": best.billing_type
+                    "billing_type": best.billing_type,
+                    "effort": vector.effort
                 }
-                return route, route, f"Emergency fallback: selected {best.id} ({best.provider})"
+                return route, route, f"Emergency fallback: selected {best.id} ({best.provider}) [Effort={vector.effort}]"
             else:
                 # All candidate providers are circuit-open!
                 raise RuntimeError("All candidate providers are circuit-open. Load shedding active.")
@@ -391,13 +388,15 @@ class ArbitrationSolver:
             "provider": primary_model.provider,
             "model": primary_model.id,
             "access_method": primary_model.access_method,
-            "billing_type": primary_model.billing_type
+            "billing_type": primary_model.billing_type,
+            "effort": vector.effort
         }
         metered_route = {
             "provider": fallback_model.provider,
             "model": fallback_model.id,
             "access_method": fallback_model.access_method,
-            "billing_type": fallback_model.billing_type
+            "billing_type": fallback_model.billing_type,
+            "effort": vector.effort
         }
 
         # Store session affinity safely (only if session_id is provided)
@@ -424,7 +423,7 @@ class ArbitrationSolver:
 
         domain_info = f", Domain={vector.domain}" if vector.domain else ""
         explanation = (
-            f"Dynamic Match (Req: R={vector.reasoning_depth:.2f}, A={vector.architecture_score:.2f}{domain_info}) -> "
+            f"Dynamic Match (Req: R={vector.reasoning_depth:.2f}, A={vector.architecture_score:.2f}, Effort={vector.effort}{domain_info}) -> "
             f"{primary_label}, "
             f"Fallback: {fallback_model.id} ({fallback_model.provider}) [{vector.explanation}]{explanation_suffix}"
         )

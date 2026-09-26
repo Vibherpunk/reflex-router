@@ -152,3 +152,14 @@ def get_domain_config(domain: str) -> Dict[str, Any]:
 def get_domain_boost(domain: str) -> float:
     return float(get_domain_config(domain).get("boost", 0.0))
 
+
+def get_tier_effort(tier: int) -> str:
+    tier_key = f"tier_{tier}"
+    mapping = load_scoring_spec().get("arbitration", {}).get("tier_effort_mapping", {})
+    return mapping.get(tier_key, "low")
+
+
+def get_effort_budget(effort: str) -> int:
+    budgets = load_scoring_spec().get("arbitration", {}).get("effort_thinking_budgets", {})
+    return int(budgets.get(effort, 2048))
+

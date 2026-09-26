@@ -25,6 +25,7 @@ from circuit_breaker import ProviderCircuitBreaker, BreakerState, ensure_breaker
 from federation import discover_harnesses, delegate_subagent
 from catalog import ModelCatalog, ReflexModelDefinition
 from solver import ArbitrationSolver, CapabilityRequestVector
+import scoring_spec
 
 logger = logging.getLogger("reflex.server")
 logging.basicConfig(level=logging.INFO)
@@ -100,6 +101,8 @@ def resolve_connection(route: Dict[str, Any], payload: Dict[str, Any], session_i
     """Resolves upstream execution URL and headers dynamically from catalog or config."""
     prov_name = route["provider"]
     model_id = route["model"]
+    effort = route.get("effort", "low")
+    budget = scoring_spec.get_effort_budget(effort)
 
     m = catalog.get(prov_name, model_id) or catalog.get_by_id(model_id)
     base_url = None
@@ -140,6 +143,40 @@ def resolve_connection(route: Dict[str, Any], payload: Dict[str, Any], session_i
     if prov_name == "openrouter":
         headers["HTTP-Referer"] = "http://127.0.0.1:8787"
         headers["X-Title"] = "Reflex-Gateway"
+
+    # Upstream reasoning effort injection
+    # 1. Gemini / Antigravity bridge:
+    is_gemini_bridge = (
+        "gemini" in prov_name.lower()
+        or "antigravity" in prov_name.lower()
+        or bool(base_url and any(k in base_url.lower() for k in ["gemini", "antigravity"]))
+    )
+    if is_gemini_bridge:
+        headers["x-gemini-reasoning-effort"] = "off" if effort == "none" else effort
+
+    # 2. Anthropic / OpenAI / OpenRouter:
+    is_anthropic = (
+        prov_name.lower() == "anthropic"
+        or "claude" in model_id.lower()
+        or "anthropic" in model_id.lower()
+    )
+    supports_reasoning_effort = (
+        prov_name.lower() == "openrouter"
+        or bool(re.search(r"(?:^|/)(o[134]|gpt-5)(?:[-_.]|$)", model_id.lower()))
+        or any(k in model_id.lower() for k in ["o1-", "o3-", "o4-", "gpt-5", "reasoning", "reasoner", "deepseek-r1"])
+    )
+
+    if prov_name.lower() in ("anthropic", "openai", "openrouter") or is_anthropic or supports_reasoning_effort:
+        if is_anthropic:
+            if effort in ("low", "medium", "high", "max"):
+                payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            else:
+                payload.pop("thinking", None)
+        elif supports_reasoning_effort:
+            if effort != "none":
+                payload["reasoning_effort"] = effort
+            else:
+                payload.pop("reasoning_effort", None)
 
     return f"{base_url.rstrip('/')}/chat/completions", headers
 
@@ -268,6 +305,8 @@ async def route_preview(request: Request):
         "status": "success",
         "tier": vector.tier_num,
         "tier_name": tier_names.get(vector.tier_num, "Custom"),
+        "effort": vector.effort,
+        "reasoning_budget": scoring_spec.get_effort_budget(vector.effort),
         "reason": reason,
         "subscription_route": primary,
         "metered_route": metered
@@ -524,7 +563,9 @@ async def chat_completions(request: Request):
                 "X-Selected-Model": model_used,
                 "X-Selected-Provider": provider_used,
                 "X-Routing-Category": category,
-                "X-Routing-Reason": explanation
+                "X-Routing-Reason": explanation,
+                "x-reflex-effort": sub_route.get("effort", "low"),
+                "x-reflex-tier": str(tier_num)
             }
         )
     else:
@@ -609,7 +650,14 @@ async def chat_completions(request: Request):
                     elif hasattr(active_b, "release_canary"):
                         await active_b.release_canary()
                 err_obj = normalize_error(resp.status_code, resp.content)
-                return JSONResponse(status_code=resp.status_code, content=err_obj)
+                return JSONResponse(
+                    status_code=resp.status_code,
+                    content=err_obj,
+                    headers={
+                        "x-reflex-effort": target.get("effort", "low"),
+                        "x-reflex-tier": str(tier_num)
+                    }
+                )
 
             if target["provider"] == sub_prov_name and sub_breaker:
                 await sub_breaker.record_success()
@@ -623,7 +671,9 @@ async def chat_completions(request: Request):
                 headers={
                     "X-Selected-Model": target["model"],
                     "X-Selected-Provider": target["provider"],
-                    "X-Routing-Reason": explanation
+                    "X-Routing-Reason": explanation,
+                    "x-reflex-effort": target.get("effort", "low"),
+                    "x-reflex-tier": str(tier_num)
                 }
             )
         except Exception as e:
