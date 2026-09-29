@@ -479,10 +479,16 @@ async def call_reflex_http_gateway(task: str, preferred_model: str = "auto", tim
     }
     t0 = time.time()
     try:
+        _gw_headers = {"Content-Type": "application/json"}
+        # Same resolution as the gateway itself (env -> ~/.env -> ~/.hermes/.env).
+        from config import get_key as _gw_get_key
+        _gw_token = _gw_get_key("REFLEX_GATEWAY_TOKEN")
+        if _gw_token:
+            _gw_headers["Authorization"] = f"Bearer {_gw_token}"
         req = urllib.request.Request(
             gateway_url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"}
+            headers=_gw_headers
         )
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             data = json.loads(resp.read().decode("utf-8"))

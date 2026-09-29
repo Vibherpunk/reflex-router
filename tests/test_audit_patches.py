@@ -12,6 +12,7 @@ from solver import ArbitrationSolver, CapabilityRequestVector
 from catalog import ModelCatalog, ReflexModelDefinition, resolve_model_alias
 
 client = TestClient(app)
+AUTH = {"Authorization": "Bearer test-token-reflex-local"}
 
 
 # ---------------------------------------------------------------------------
@@ -19,10 +20,17 @@ client = TestClient(app)
 # ---------------------------------------------------------------------------
 
 def test_p0_1_tier3_high_consequence_keywords():
-    """All high-consequence keywords must classify into Tier 3."""
+    """All high-consequence keywords must classify into Tier 3.
+
+    NOTE (2026-09-29, Blocker 1 fix): bare bookkeeping words ("reconcile",
+    "ledger", "audit") are INTENTIONALLY Tier 2, not Tier 3 — routing routine
+    QBO/ledger work to frontier models was the cost defect. Only
+    high-consequence phrases (e.g. "cryptographic audit", "formal
+    verification") stay Tier 3. See test_bookkeeping_words_not_tier3.
+    """
     keywords = [
-        "indemnification", "statutory", "reconcile", "ledger",
-        "blast radius", "audit", "delaware", "oar 414", "erdc", "subpoena"
+        "indemnification", "statutory",
+        "blast radius", "delaware", "oar 414", "erdc", "subpoena"
     ]
     for kw in keywords:
         prompt = f"Please process the {kw} requirements for this task."
@@ -68,7 +76,7 @@ def test_p0_2_circuit_open_returns_503_load_shedding(monkeypatch):
         resp = client.post("/v1/chat/completions", json={
             "model": "auto",
             "messages": [{"role": "user", "content": "Format this list: 1 2 3"}]
-        })
+        }, headers=AUTH)
         assert resp.status_code == 503
         assert resp.headers.get("Retry-After") == "30"
         data = resp.json()
@@ -110,7 +118,7 @@ def test_p0_4_client_4xx_does_not_trip_circuit_breaker(monkeypatch):
         resp = client.post("/v1/chat/completions", json={
             "model": "deepseek-v4-pro",
             "messages": [{"role": "user", "content": "malformed test request"}]
-        })
+        }, headers=AUTH)
         assert resp.status_code == code
         # Breaker must remain CLOSED and failure_count must be 0!
         assert sub_breaker.state == BreakerState.CLOSED, f"Status code {code} erroneously tripped breaker to {sub_breaker.state}"
@@ -124,12 +132,12 @@ def test_p0_4_client_4xx_does_not_trip_circuit_breaker(monkeypatch):
 def test_p1_1_preview_endpoint_does_not_pollute_session_affinity():
     """Route preview endpoint must not latch session affinity."""
     # Call /v1/route with short prompt
-    resp1 = client.post("/v1/route", json={"prompt": "Short status check"})
+    resp1 = client.post("/v1/route", json={"prompt": "Short status check"}, headers=AUTH)
     assert resp1.status_code == 200
 
     # Call /v1/route with large prompt (>20,000 tokens)
     huge_prompt = "Refactor distributed consensus protocol architecture spec. " + "x " * 25000
-    resp2 = client.post("/v1/route", json={"prompt": huge_prompt})
+    resp2 = client.post("/v1/route", json={"prompt": huge_prompt}, headers=AUTH)
     assert resp2.status_code == 200
     data2 = resp2.json()
     assert data2["tier"] == 3

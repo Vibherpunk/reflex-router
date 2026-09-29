@@ -16,10 +16,13 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, AsyncGenerator, List
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Response, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, Response, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from config import CONFIG, get_key
+from config import CONFIG, VERSION, get_key
+from auth import verify_gateway_token, token_configured
+from decision_log import log_decision
+from scoring_spec import get_spec_hash
 from memory import record_incident, get_stats, log_request
 from circuit_breaker import ProviderCircuitBreaker, BreakerState, ensure_breaker, BREAKER_REGISTRY
 from federation import discover_harnesses, delegate_subagent
@@ -51,6 +54,12 @@ def _background_catalog_refresh():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not token_configured():
+        raise RuntimeError(
+            "REFLEX_GATEWAY_TOKEN is not set (checked $REFLEX_GATEWAY_TOKEN, "
+            "$HOME/.env, $HOME/.hermes/.env). Refusing to start an unauthenticated "
+            "gateway."
+        )
     limits = httpx.Limits(max_keepalive_connections=100, max_connections=300, keepalive_expiry=60.0)
     gateway_pool.client = httpx.AsyncClient(limits=limits, timeout=httpx.Timeout(120.0, connect=15.0))
     logger.info("Reflex Gateway HTTP connection pool initialized.")
@@ -64,7 +73,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Reflex System 1 Router",
-    version="2.2.0",
+    version=VERSION,
     description="Intelligent Multi-Provider Capability Router with Dynamic Arbitration",
     lifespan=lifespan
 )
@@ -180,6 +189,43 @@ def resolve_connection(route: Dict[str, Any], payload: Dict[str, Any], session_i
 
     return f"{base_url.rstrip('/')}/chat/completions", headers
 
+def _last_user_content(messages) -> str:
+    """Content string of the last user-role message (mirrors classifier extraction)."""
+    for m in reversed(messages or []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            c = m.get("content", "")
+            return c if isinstance(c, str) else str(c)
+    return ""
+
+
+def _log_route_decision(*, endpoint, session_id, messages, tier, effort, explanation,
+                        model, provider, billing_type, route_category, token_count,
+                        latency_ms=0.0, supersedes=None):
+    """Append a structured routing-decision record. Never raises (see decision_log)."""
+    version = catalog.version_info()
+    m = re.search(r"Incident #(\d+)", explanation or "")
+    return log_decision(
+        endpoint=endpoint,
+        session_id=session_id or "",
+        prompt_text=_last_user_content(messages),
+        tier=tier,
+        effort=effort,
+        model=model,
+        provider=provider,
+        billing_type=billing_type,
+        reason=explanation,
+        route_category=route_category,
+        catalog_epoch=version["catalog_epoch"],
+        catalog_refreshed_at=version["catalog_refreshed_at"],
+        spec_hash=get_spec_hash(),
+        token_count=token_count,
+        latency_ms=latency_ms,
+        kv_latch_applied=(explanation or "").startswith("KV-Cache Latch"),
+        memory_incident_id=int(m.group(1)) if m else None,
+        supersedes=supersedes,
+    )
+
+
 def select_candidate_routes(
     payload: Dict[str, Any],
     session_id: str,
@@ -215,12 +261,12 @@ async def health_check():
     return {
         "status": "active",
         "service": "Reflex Multi-Provider Intelligent Gateway",
-        "version": "2.2.0",
+        "version": VERSION,
         "catalog_size": len(catalog.list_all()),
         "providers": providers_summary
     }
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(verify_gateway_token)])
 async def list_models():
     """Returns OpenAI-compatible model listing from dynamic catalog."""
     models_list = [
@@ -239,13 +285,13 @@ async def list_models():
         })
     return {"object": "list", "data": models_list}
 
-@app.post("/v1/catalog/refresh")
+@app.post("/v1/catalog/refresh", dependencies=[Depends(verify_gateway_token)])
 async def refresh_catalog(force: bool = True):
     """Refreshes live model catalog across all harnesses and APIs."""
     catalog.refresh_from_providers(force=force)
     return {"status": "refreshed", "catalog_size": len(catalog.list_all())}
 
-@app.post("/v1/feedback")
+@app.post("/v1/feedback", dependencies=[Depends(verify_gateway_token)])
 async def submit_feedback(request: Request):
     data = await request.json()
     prompt = str(data.get("prompt", "")).strip()
@@ -263,25 +309,26 @@ async def submit_feedback(request: Request):
     )
     return {"status": "recorded", "incident_id": inc_id, "escalated_tier": escalated_tier}
 
-@app.get("/v1/stats")
+@app.get("/v1/stats", dependencies=[Depends(verify_gateway_token)])
 async def get_router_stats():
     stats = get_stats()
     stats["circuit_breakers"] = {name: b.get_status() for name, b in BREAKER_REGISTRY.items()}
     stats["catalog_size"] = len(catalog.list_all())
     return stats
 
-@app.get("/v1/harnesses")
+@app.get("/v1/harnesses", dependencies=[Depends(verify_gateway_token)])
 async def get_harnesses(rescan: bool = False):
     """Returns all auto-discovered local CLI agent harnesses on this machine."""
     return discover_harnesses(force_rescan=rescan)
 
-@app.post("/v1/route")
+@app.post("/v1/route", dependencies=[Depends(verify_gateway_token)])
 async def route_preview(request: Request):
     """Previews dynamic capability arbitration and provider routing without execution."""
     data = await request.json()
     prompt = str(data.get("prompt", "")).strip()
     messages = data.get("messages", [{"role": "user", "content": prompt}])
     requested_model = data.get("model", "auto")
+    t_route = time.perf_counter()
     vector = solver.extract_vector(messages, requested_model)
     try:
         primary, metered, reason = solver.arbitrate(
@@ -289,6 +336,7 @@ async def route_preview(request: Request):
             session_id=None,
             requested_model=requested_model
         )
+        t_route = time.perf_counter() - t_route
     except RuntimeError as e:
         return JSONResponse(
             status_code=503,
@@ -301,6 +349,20 @@ async def route_preview(request: Request):
         2: "Deep Reasoning / Concurrency / Bugfix",
         3: "Frontier Architecture / System Specs"
     }
+    _log_route_decision(
+        endpoint="/v1/route",
+        session_id="",
+        messages=messages,
+        latency_ms=t_route * 1000.0,
+        tier=vector.tier_num,
+        effort=vector.effort,
+        explanation=reason,
+        model=primary["model"],
+        provider=primary["provider"],
+        billing_type=primary.get("billing_type", "unknown"),
+        route_category="preview",
+        token_count=vector.token_count,
+    )
     return {
         "status": "success",
         "tier": vector.tier_num,
@@ -312,7 +374,7 @@ async def route_preview(request: Request):
         "metered_route": metered
     }
 
-@app.post("/v1/delegate")
+@app.post("/v1/delegate", dependencies=[Depends(verify_gateway_token)])
 async def handle_delegation(request: Request):
     """
     CLI Harness Federation: Delegates a subagent task to an installed CLI agent harness.
@@ -519,13 +581,15 @@ async def preflight_and_stream(
 
     return stream_generator, target_route["model"], target_route["provider"], route_category
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_gateway_token)])
 async def chat_completions(request: Request):
     payload = await request.json()
     session_id = get_session_id(payload, request.headers)
 
+    t_route = time.perf_counter()
     try:
         sub_route, metered_route, tier_num, explanation = select_candidate_routes(payload, session_id)
+        t_route = time.perf_counter() - t_route
     except RuntimeError as e:
         return JSONResponse(
             status_code=503,
@@ -553,6 +617,30 @@ async def chat_completions(request: Request):
             payload=payload,
             session_id=session_id,
             request=request
+        )
+        _supersedes = None
+        if (model_used, provider_used) != (sub_route["model"], sub_route["provider"]):
+            # Speculative failover fired: chain the superseded plan for audit.
+            _supersedes = _log_route_decision(
+                endpoint="/v1/chat/completions", session_id=session_id,
+                messages=payload.get("messages", []), tier=tier_num,
+                effort=sub_route.get("effort", "low"), explanation=explanation,
+                model=sub_route["model"], provider=sub_route["provider"],
+                billing_type=sub_route.get("billing_type", "unknown"),
+                route_category="planned_superseded",
+                token_count=estimate_tokens(payload),
+                latency_ms=t_route * 1000.0,
+            )
+        _exec = sub_route if provider_used == sub_route["provider"] else metered_route
+        _log_route_decision(
+            endpoint="/v1/chat/completions", session_id=session_id,
+            messages=payload.get("messages", []), tier=tier_num,
+            effort=sub_route.get("effort", "low"), explanation=explanation,
+            model=model_used, provider=provider_used,
+            billing_type=_exec.get("billing_type", "unknown"),
+            route_category=category, token_count=estimate_tokens(payload),
+            latency_ms=t_route * 1000.0,
+            supersedes=_supersedes,
         )
         return StreamingResponse(
             generator_func(),
@@ -664,6 +752,30 @@ async def chat_completions(request: Request):
             elif target["provider"] == metered_prov_name and metered_breaker:
                 await metered_breaker.record_success()
 
+            _supersedes = None
+            if (target["model"], target["provider"]) != (sub_route["model"], sub_route["provider"]):
+                _supersedes = _log_route_decision(
+                    endpoint="/v1/chat/completions", session_id=session_id,
+                    messages=payload.get("messages", []), tier=tier_num,
+                    effort=sub_route.get("effort", "low"), explanation=explanation,
+                    model=sub_route["model"], provider=sub_route["provider"],
+                    billing_type=sub_route.get("billing_type", "unknown"),
+                    route_category="planned_superseded",
+                    token_count=estimate_tokens(payload),
+                    latency_ms=t_route * 1000.0,
+                )
+            _log_route_decision(
+                endpoint="/v1/chat/completions", session_id=session_id,
+                messages=payload.get("messages", []), tier=tier_num,
+                effort=sub_route.get("effort", "low"), explanation=explanation,
+                model=target["model"], provider=target["provider"],
+                billing_type=target.get("billing_type", "unknown"),
+                route_category=("subscription_zero_marginal_cost"
+                                if target["provider"] == sub_prov_name else "metered_fallback"),
+                token_count=estimate_tokens(payload),
+                latency_ms=t_route * 1000.0,
+                supersedes=_supersedes,
+            )
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,

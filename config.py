@@ -11,6 +11,8 @@ from typing import Dict, Any, Optional
 HOME = Path.home()
 AUTH_FILE = HOME / ".local/share/opencode/auth.json"
 HERMES_ENV_FILE = HOME / ".hermes/.env"
+
+VERSION = "2.3.0"
 GLOBAL_ENV_FILE = HOME / ".env"
 
 def _load_env_files() -> Dict[str, str]:

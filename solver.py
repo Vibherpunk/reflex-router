@@ -4,15 +4,13 @@ Executes sub-5ms deterministic matching between conversation requirements and
 live model catalog. Prioritizes $0.00 marginal-cost subscriptions with automatic
 metered fallback when needed or when circuit breakers trip.
 """
-import re
 import time
 import threading
 from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 from catalog import ReflexModelDefinition, ModelCatalog, resolve_model_alias
 from circuit_breaker import BREAKER_REGISTRY, ensure_breaker
-from classifier import detect_tool_errors, classify_domain, TIER3_PATTERNS, TIER2_PATTERNS, TIER1_PATTERNS, PROTECTED_DOMAINS
-from memory import check_memory, record_incident
+from classifier import classify_domain, classify_request, PROTECTED_DOMAINS
 import scoring_spec
 
 @dataclass
@@ -36,9 +34,6 @@ class ArbitrationSolver:
     def extract_vector(self, messages: List[Dict[str, Any]], requested_model: str = "auto") -> CapabilityRequestVector:
         """Extracts capability requirements from message context in <2ms."""
         p0 = scoring_spec.get_tier_threshold_profile(0)
-        p1 = scoring_spec.get_tier_threshold_profile(1)
-        p2 = scoring_spec.get_tier_threshold_profile(2)
-        p3 = scoring_spec.get_tier_threshold_profile(3)
 
         if not messages:
             return CapabilityRequestVector(
@@ -96,111 +91,26 @@ class ArbitrationSolver:
                 effort=effort
             )
 
-        # 1. Trojan Horse Check: Preceding tool failures
-        has_execution_error = detect_tool_errors(messages)
-        if has_execution_error:
-            if last_user_content:
-                try:
-                    record_incident(
-                        prompt=last_user_content,
-                        failed_tier=0,
-                        escalated_tier=2,
-                        error_signature="Compiler/test error in preceding tool outputs"
-                    )
-                except Exception:
-                    pass
-            return build_vector(
-                tier_num=2,
-                reasoning_depth=p2.get("reasoning_depth", 0.90),
-                architecture_score=p2.get("architecture_score", 0.75),
-                explanation="Escalated to Tier 2: Detected test/compiler error in prior execution"
-            )
-
-        # 2. System 1 Memory Check: Learned incidents
-        if last_user_content:
-            try:
-                mem_threshold = float(scoring_spec.get_classification_param("memory_threshold", 0.55))
-                mem_hit = check_memory(last_user_content, threshold=mem_threshold)
-                if mem_hit:
-                    esc_tier = mem_hit["escalated_tier"]
-                    inc_id = mem_hit["incident_id"]
-                    sim = mem_hit["similarity"]
-                    sample_snippet = mem_hit["sample"][:35]
-                    esc_defaults = scoring_spec.get_memory_escalation_defaults(esc_tier)
-                    r_depth = esc_defaults.get("reasoning_depth", 0.95 if esc_tier >= 2 else 0.60)
-                    a_score = esc_defaults.get("architecture_score", 0.95 if esc_tier == 3 else 0.70)
-                    return build_vector(
-                        tier_num=esc_tier,
-                        reasoning_depth=r_depth,
-                        architecture_score=a_score,
-                        explanation=f"Memory Auto-Escalation (Incident #{inc_id}, sim={sim}): learned from prior failure in '{sample_snippet}'"
-                    )
-            except Exception:
-                pass
-
-        # 3. Frontier Architecture patterns (Tier 3)
-        for pattern in TIER3_PATTERNS:
-            if re.search(pattern, last_user_content):
-                return build_vector(
-                    tier_num=3,
-                    reasoning_depth=p3.get("reasoning_depth", 0.95),
-                    architecture_score=p3.get("architecture_score", 0.95),
-                    explanation=f"Matched Tier 3 Architecture pattern: {pattern}"
-                )
-
-        # 4. Deep Reasoning / Concurrency patterns (Tier 2)
-        for pattern in TIER2_PATTERNS:
-            if re.search(pattern, last_user_content):
-                return build_vector(
-                    tier_num=2,
-                    reasoning_depth=p2.get("reasoning_depth", 0.90),
-                    architecture_score=p2.get("architecture_score", 0.75),
-                    explanation=f"Matched Tier 2 Concurrency pattern: {pattern}"
-                )
-
-        # 5. Domain Promotion Floor: legal, finance, accounting, compliance, security -> min Tier 2 (or Tier 3 if high blast radius)
-        if detected_domain in PROTECTED_DOMAINS:
-            if re.search(r"(?i)\bblast[- ]radius\b", last_user_content):
-                return build_vector(
-                    tier_num=3,
-                    reasoning_depth=p3.get("reasoning_depth", 0.95),
-                    architecture_score=p3.get("architecture_score", 0.95),
-                    explanation=f"Domain hard floor (Tier 3 - high blast radius) enforced for '{detected_domain}'"
-                )
-            return build_vector(
-                tier_num=2,
-                reasoning_depth=p2.get("reasoning_depth", 0.90),
-                architecture_score=p2.get("architecture_score", 0.75),
-                explanation=f"Domain hard floor (Tier 2) enforced for '{detected_domain}'"
-            )
-
-        # 6. General Implementation / Feature patterns (Tier 1)
-        for pattern in TIER1_PATTERNS:
-            if re.search(pattern, last_user_content):
-                return build_vector(
-                    tier_num=1,
-                    reasoning_depth=p1.get("reasoning_depth", 0.45),
-                    architecture_score=p1.get("architecture_score", 0.50),
-                    explanation=f"Matched Tier 1 Implementation pattern: {pattern}"
-                )
-
-        # 6. Length heuristic: substantive implementation threshold
-        word_threshold = int(scoring_spec.get_classification_param("word_count_tier1_threshold", 80))
-        words = len(last_user_content.split())
-        if words > word_threshold:
-            return build_vector(
-                tier_num=1,
-                reasoning_depth=p1.get("reasoning_depth", 0.45),
-                architecture_score=p1.get("architecture_score", 0.50),
-                explanation=f"Assigned Tier 1 by length ({words} words)"
-            )
-
-        # 7. Default routine query / tool churn (Tier 0)
+        # Consolidated 2026-09-29: classifier.classify_request is the single tier
+        # authority (see REFLEX_BLOCKER_FIX_DESIGN.md). solver keeps only
+        # effort-mapping (in build_vector) and capability-profile lookup.
+        # The memory-escalation branch uses WEAKER capability defaults than the
+        # plain tier profile -- preserved here so routing is unchanged.
+        tier_num, tier_explanation = classify_request(messages)
+        if "Memory Auto-Escalation" in tier_explanation:
+            esc_defaults = scoring_spec.get_memory_escalation_defaults(tier_num)
+            reasoning_depth = esc_defaults.get("reasoning_depth", 0.95 if tier_num >= 2 else 0.60)
+            architecture_score = esc_defaults.get("architecture_score", 0.95 if tier_num == 3 else 0.70)
+        else:
+            profile = scoring_spec.get_tier_threshold_profile(tier_num)
+            _fb = {0: (0.10, 0.20), 1: (0.45, 0.50), 2: (0.90, 0.75), 3: (0.95, 0.95)}[tier_num]
+            reasoning_depth = profile.get("reasoning_depth", _fb[0])
+            architecture_score = profile.get("architecture_score", _fb[1])
         return build_vector(
-            tier_num=0,
-            reasoning_depth=p0.get("reasoning_depth", 0.10),
-            architecture_score=p0.get("architecture_score", 0.20),
-            explanation="Default Tier 0: Routine query or tool-churn step"
+            tier_num=tier_num,
+            reasoning_depth=reasoning_depth,
+            architecture_score=architecture_score,
+            explanation=tier_explanation
         )
 
     def arbitrate(

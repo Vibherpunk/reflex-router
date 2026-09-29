@@ -322,6 +322,9 @@ class ModelCatalog:
         self._per_provider_refresh: Dict[str, float] = {}
         self._load_cache()
         self._refresh_lock = threading.Lock()
+        self.catalog_epoch: int = 0        # bumped on every successful provider refresh
+        self.last_refresh_ts: float = 0.0  # wall-clock of last successful refresh
+        self._restore_meta()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
@@ -371,6 +374,43 @@ class ModelCatalog:
                 conn.execute("ALTER TABLE models ADD COLUMN domain_specialization TEXT")
             except sqlite3.OperationalError:
                 pass
+
+            # 2026-09-29 (blocker 5): append-only history for reproducible routing.
+            # The live `models` table stays INSERT OR REPLACE (one row per id/provider);
+            # every successful refresh appends a full snapshot here, keyed by epoch.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS models_history (
+                    epoch INTEGER NOT NULL,
+                    id TEXT,
+                    provider TEXT,
+                    display_name TEXT,
+                    access_method TEXT,
+                    billing_type TEXT,
+                    context_window INTEGER,
+                    max_output_tokens INTEGER,
+                    reasoning_capability REAL,
+                    architecture_score REAL,
+                    coding_score REAL,
+                    speed_score REAL,
+                    tool_calling INTEGER,
+                    input_cost_per_m REAL,
+                    output_cost_per_m REAL,
+                    last_updated REAL,
+                    base_url TEXT,
+                    api_key_env TEXT,
+                    harness_binary TEXT,
+                    generation REAL,
+                    tier TEXT,
+                    domain_specialization TEXT,
+                    PRIMARY KEY (epoch, provider, id)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS catalog_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
 
     def _load_cache(self):
         with self._connect() as conn:
@@ -449,6 +489,70 @@ class ModelCatalog:
             ensure_breaker(m.provider)
         self._memory_cache = new_cache
 
+    def version_info(self) -> Dict[str, Any]:
+        """Current catalog version stamp, logged with every routing decision."""
+        return {"catalog_epoch": self.catalog_epoch,
+                "catalog_refreshed_at": self.last_refresh_ts}
+
+    def snapshot(self, epoch: int) -> List[ReflexModelDefinition]:
+        """Models as they were at `epoch`: history rows at the greatest epoch <= requested.
+
+        Enables audit-mode replay of routing decisions without the original prompt.
+        """
+        cols = "id, provider, display_name, access_method, billing_type, context_window, max_output_tokens, reasoning_capability, architecture_score, coding_score, speed_score, tool_calling, input_cost_per_m, output_cost_per_m, last_updated, base_url, api_key_env, harness_binary, generation, tier, domain_specialization"
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT {cols} FROM models_history WHERE epoch = "
+                "(SELECT MAX(epoch) FROM models_history WHERE epoch <= ?)",
+                (epoch,),
+            )
+            out = []
+            for row in cur.fetchall():
+                d = dict(row)
+                d["tool_calling"] = bool(d["tool_calling"])
+                out.append(ReflexModelDefinition(**d))
+            return out
+
+    def _persist_meta(self) -> None:
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO catalog_meta (key, value) VALUES (?, ?)",
+                    ("catalog_epoch", str(self.catalog_epoch)),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO catalog_meta (key, value) VALUES (?, ?)",
+                    ("last_refresh_ts", str(self.last_refresh_ts)),
+                )
+        except Exception:
+            pass
+
+    def _restore_meta(self) -> None:
+        try:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT key, value FROM catalog_meta")
+                meta = dict(cur.fetchall())
+            self.catalog_epoch = int(meta.get("catalog_epoch", 0) or 0)
+            self.last_refresh_ts = float(meta.get("last_refresh_ts", 0.0) or 0.0)
+        except Exception:
+            pass
+
+    def _append_history_snapshot(self) -> None:
+        """Append-once copy of the current `models` rows, stamped with this epoch."""
+        cols = "id, provider, display_name, access_method, billing_type, context_window, max_output_tokens, reasoning_capability, architecture_score, coding_score, speed_score, tool_calling, input_cost_per_m, output_cost_per_m, last_updated, base_url, api_key_env, harness_binary, generation, tier, domain_specialization"
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    f"INSERT INTO models_history (epoch, {cols}) "
+                    f"SELECT ?, {cols} FROM models",
+                    (self.catalog_epoch,),
+                )
+        except Exception:
+            pass
+
     def rescore_all(self):
         """Re-evaluates all cached models with current heuristic scoring and persists them."""
         models = self.list_all()
@@ -488,6 +592,10 @@ class ModelCatalog:
 
             if discovered:
                 self.upsert_models(discovered)
+                self.catalog_epoch += 1
+                self.last_refresh_ts = time.time()
+                self._persist_meta()
+                self._append_history_snapshot()
         finally:
             self._refresh_lock.release()
 

@@ -10,6 +10,7 @@ from circuit_breaker import BreakerState
 from server import app, estimate_tokens, get_session_id, select_candidate_routes, normalize_error
 
 client = TestClient(app)
+AUTH = {"Authorization": "Bearer test-token-reflex-local"}
 
 def test_health_endpoint():
     response = client.get("/health")
@@ -24,7 +25,7 @@ def test_health_endpoint():
     assert data["catalog_size"] > 0
 
 def test_models_endpoint():
-    response = client.get("/v1/models")
+    response = client.get("/v1/models", headers=AUTH)
     assert response.status_code == 200
     data = response.json()
     model_ids = [m["id"] for m in data["data"]]
@@ -126,7 +127,7 @@ def test_feedback_and_memory_escalation():
         "escalated_tier": 3,
         "error": "Failed to handle AST node nesting"
     }
-    resp = client.post("/v1/feedback", json=feedback_payload)
+    resp = client.post("/v1/feedback", json=feedback_payload, headers=AUTH)
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "recorded"
@@ -138,7 +139,7 @@ def test_feedback_and_memory_escalation():
     assert "Memory Auto-Escalation" in reason
 
 def test_stats_endpoint():
-    resp = client.get("/v1/stats")
+    resp = client.get("/v1/stats", headers=AUTH)
     assert resp.status_code == 200
     data = resp.json()
     assert "total_incidents" in data
@@ -146,21 +147,25 @@ def test_stats_endpoint():
     assert "opencode-go" in data["circuit_breakers"]
 
 def test_harnesses_endpoint():
-    resp = client.get("/v1/harnesses")
+    resp = client.get("/v1/harnesses", headers=AUTH)
     assert resp.status_code == 200
     data = resp.json()
     assert "harnesses" in data
     assert "claude" in data["harnesses"]
-    assert "agy" in data["harnesses"]
-    assert "opencode" in data["harnesses"]
+    # agy/opencode only exist on Adam's Mac: assert discovery finds them
+    # wherever they are actually installed, skip the assertion elsewhere.
+    import shutil
+    for name in ("agy", "opencode"):
+        if shutil.which(name):
+            assert name in data["harnesses"], f"{name} installed but not discovered"
 
 def test_delegate_endpoint_validation():
     # Empty task returns 400
-    resp = client.post("/v1/delegate", json={"task": ""})
+    resp = client.post("/v1/delegate", json={"task": ""}, headers=AUTH)
     assert resp.status_code == 400
 
 def test_route_preview_endpoint():
-    resp = client.post("/v1/route", json={"prompt": "Design the system architecture for distributed consensus"})
+    resp = client.post("/v1/route", json={"prompt": "Design the system architecture for distributed consensus"}, headers=AUTH)
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "success"
@@ -173,7 +178,7 @@ def test_delegate_endpoint_recursion_limit():
         "task": "recursive delegation attempt",
         "delegation_depth": 2,
         "delegation_chain": "agy:opencode"
-    })
+    }, headers=AUTH)
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "error"
@@ -280,7 +285,7 @@ def test_non_streaming_sub_500_trips_breaker_and_releases_canary(monkeypatch):
             "model": "auto", "stream": False,
             "session_id": "test-sub-500-session",
             "messages": [{"role": "user", "content": "Format this list: 1 2 3"}]
-        })
+        }, headers=AUTH)
         assert resp.status_code == 500
         assert breaker.state == BreakerState.OPEN
         assert breaker.canary_in_flight is False
@@ -310,7 +315,7 @@ def test_non_streaming_sub_504_failover_now_includes_504(monkeypatch):
             "model": "auto", "stream": False,
             "session_id": "test-sub-504-session",
             "messages": [{"role": "user", "content": "Format this list: 1 2 3"}]
-        })
+        }, headers=AUTH)
         assert resp.status_code == 200
         assert resp.headers.get("X-Selected-Provider") == "openrouter"
         assert breaker.state == BreakerState.OPEN
@@ -341,7 +346,7 @@ def test_non_streaming_sub_transport_error_trips_breaker(monkeypatch):
             "model": "auto", "stream": False,
             "session_id": "test-sub-transport-session",
             "messages": [{"role": "user", "content": "Format this list: 1 2 3"}]
-        })
+        }, headers=AUTH)
         assert resp.status_code == 502
         assert breaker.state == BreakerState.OPEN
         assert breaker.canary_in_flight is False
@@ -368,7 +373,7 @@ def test_streaming_sub_500_trips_breaker_and_releases_canary(monkeypatch):
             "model": "auto", "stream": True,
             "session_id": "test-sub-stream-session",
             "messages": [{"role": "user", "content": "Format this list: 1 2 3"}]
-        })
+        }, headers=AUTH)
         assert resp.status_code == 500
         assert breaker.state == BreakerState.OPEN
         assert breaker.canary_in_flight is False

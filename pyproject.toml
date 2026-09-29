@@ -1,6 +1,6 @@
 [project]
 name = "reflex-router"
-version = "2.1.0"
+version = "2.3.0"
 description = "Reflex System 1 Multi-Provider Intelligent Gateway & CLI Harness Federation"
 dependencies = [
     "fastapi>=0.115.0",

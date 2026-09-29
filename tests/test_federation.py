@@ -23,7 +23,9 @@ from federation import (
     rollback_git_state,
     MAX_DELEGATION_DEPTH
 )
+from conftest import requires_harnesses
 
+@requires_harnesses("agy", "claude", "opencode", "goose", "codex", authenticated=False)
 def test_harness_discovery_detects_installed_clis():
     manifest = discover_harnesses(force_rescan=True)
     assert "harnesses" in manifest
@@ -40,6 +42,7 @@ def test_harness_discovery_detects_installed_clis():
     assert harnesses["agy"]["binary_path"].endswith("agy")
     assert harnesses["opencode"]["binary_path"].endswith("opencode")
 
+@requires_harnesses("claude", "opencode", "codex", "agy")
 def test_select_harness_for_model():
     manifest = discover_harnesses()
     assert select_harness_for_model("claude-3.7-sonnet", manifest) == "claude"
@@ -142,6 +145,7 @@ def test_selective_git_rollback(tmp_path):
     assert tracked.read_text() == "developer uncommitted work\n"
 
 @pytest.mark.anyio
+@requires_harnesses("claude", "opencode")
 async def test_failover_waterfall_when_primary_429():
     call_counts = {}
 

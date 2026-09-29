@@ -17,6 +17,7 @@ from server import app, resolve_connection, select_candidate_routes
 from circuit_breaker import BreakerState
 
 client = TestClient(app)
+AUTH = {"Authorization": "Bearer test-token-reflex-local"}
 
 
 def test_scoring_spec_tier_effort_mapping():
@@ -138,7 +139,7 @@ def test_arbitration_attaches_effort_and_explanation():
 def test_v1_route_endpoint_returns_effort_and_budget():
     """The /v1/route endpoint must return effort and reasoning_budget in the JSON response."""
     # Tier 0
-    resp0 = client.post("/v1/route", json={"prompt": "Format this list of numbers: 1, 2, 3"})
+    resp0 = client.post("/v1/route", json={"prompt": "Format this list of numbers: 1, 2, 3"}, headers=AUTH)
     assert resp0.status_code == 200
     data0 = resp0.json()
     assert data0["tier"] == 0
@@ -148,7 +149,7 @@ def test_v1_route_endpoint_returns_effort_and_budget():
     assert data0["metered_route"]["effort"] == data0["effort"]
 
     # Tier 1
-    resp1 = client.post("/v1/route", json={"prompt": "Implement the user profile view component and refactor tests"})
+    resp1 = client.post("/v1/route", json={"prompt": "Implement the user profile view component and refactor tests"}, headers=AUTH)
     assert resp1.status_code == 200
     data1 = resp1.json()
     assert data1["tier"] == 1
@@ -156,7 +157,7 @@ def test_v1_route_endpoint_returns_effort_and_budget():
     assert data1["reasoning_budget"] == 2048
 
     # Tier 2
-    resp2 = client.post("/v1/route", json={"prompt": "Find the race condition and deadlock in this channel worker"})
+    resp2 = client.post("/v1/route", json={"prompt": "Find the race condition and deadlock in this channel worker"}, headers=AUTH)
     assert resp2.status_code == 200
     data2 = resp2.json()
     assert data2["tier"] == 2
@@ -164,7 +165,7 @@ def test_v1_route_endpoint_returns_effort_and_budget():
     assert data2["reasoning_budget"] == 8192
 
     # Tier 3
-    resp3 = client.post("/v1/route", json={"prompt": "Draft the RFC spec for distributed consensus with zero-downtime"})
+    resp3 = client.post("/v1/route", json={"prompt": "Draft the RFC spec for distributed consensus with zero-downtime"}, headers=AUTH)
     assert resp3.status_code == 200
     data3 = resp3.json()
     assert data3["tier"] == 3
@@ -259,7 +260,7 @@ def test_chat_completions_response_headers(monkeypatch):
         "stream": False,
         "session_id": "test-headers-sess",
         "messages": [{"role": "user", "content": "Find the race condition and deadlock in this channel worker"}]
-    })
+    }, headers=AUTH)
 
     assert resp.status_code == 200
     assert resp.headers.get("x-reflex-effort") == "medium"

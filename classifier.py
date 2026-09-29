@@ -12,7 +12,18 @@ TIER3_PATTERNS = [
     r"(?i)(?:^|\s)(--deep|#hard|#architect|#spec)(?:\s|$)",
     r"(?i)\b(system architecture|architecture|rfc|specification|database migration|distributed|consensus|byzantine|split-brain)\b",
     r"(?i)\b(zero[- ]downtime|formal verification|cryptographic audit|security vulnerability|threat model)\b",
-    r"(?i)\b(indemnification|statutory|reconcile|ledger|blast radius|audit|delaware|oar[- ]?414|erdc|subpoena)\b"
+    # NOTE (2026-09-29, blocker fix): bare bookkeeping words "audit", "reconcile",
+    # "ledger" were REMOVED from Tier 3. They now fall through to the protected-domain
+    # hard floor (accounting/finance/compliance -> Tier 2). Genuinely high-consequence
+    # terms stay: indemnification, statutory, subpoena, delaware, oar 414, erdc,
+    # blast radius. "cryptographic audit" stays Tier 3 via the pattern above (multi-word).
+    r"(?i)\b(indemnification|statutory|blast radius|delaware|oar[- ]?414|erdc|subpoena)\b"
+]
+
+# Tier 2: careful-work signals that must NOT reach Tier 3 (cost defect fix 2026-09-29).
+# Bare bookkeeping words land here when no protected-domain floor fires first.
+TIER2_BOOKKEEPING_PATTERNS = [
+    r"(?i)\b(audit|reconcile|reconciliation|ledger)\b"
 ]
 
 TIER2_PATTERNS = [
@@ -130,6 +141,14 @@ def classify_request(messages: List[Dict[str, Any]]) -> Tuple[int, str]:
     for pattern in TIER2_PATTERNS:
         if re.search(pattern, last_user_content):
             return 2, f"Matched Tier 2 pattern: {pattern}"
+
+    # 4b. Bookkeeping words (2026-09-29 blocker fix): bare "audit"/"reconcile"/
+    # "ledger" were removed from Tier 3. They land here at Tier 2 — careful work,
+    # never frontier-architecture spend. Checked before the domain floor so the
+    # tier is guaranteed even when no domain keyword matches.
+    for pattern in TIER2_BOOKKEEPING_PATTERNS:
+        if re.search(pattern, last_user_content):
+            return 2, f"Matched Tier 2 bookkeeping pattern: {pattern}"
 
     # 5. Domain Promotion Floor: legal, finance, accounting, compliance, security -> min Tier 2 (or Tier 3 if high blast radius)
     detected_domain = classify_domain(messages)
