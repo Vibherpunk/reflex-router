@@ -11,6 +11,8 @@ from typing import Dict, Any, Optional
 HOME = Path.home()
 AUTH_FILE = HOME / ".local/share/opencode/auth.json"
 HERMES_ENV_FILE = HOME / ".hermes/.env"
+
+VERSION = "2.3.0"
 GLOBAL_ENV_FILE = HOME / ".env"
 
 def _load_env_files() -> Dict[str, str]:
@@ -29,6 +31,16 @@ def _load_env_files() -> Dict[str, str]:
 
 HERMES_ENV = _load_env_files()
 
+# Router-local gateway token file (chmod 600, gitignored). Last-resort source for
+# REFLEX_GATEWAY_TOKEN so MCP clients that don't inherit the launchd env can auth.
+GATEWAY_TOKEN_FILE = Path(__file__).resolve().parent / ".gateway_token"
+
+def _read_gateway_token_file() -> str:
+    try:
+        return GATEWAY_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
 def get_key(var_name: str, fallback_hermes_name: Optional[str] = None) -> str:
     """Retrieve key from env, hermes .env, or opencode auth.json."""
     if os.environ.get(var_name):
@@ -39,6 +51,8 @@ def get_key(var_name: str, fallback_hermes_name: Optional[str] = None) -> str:
         return HERMES_ENV[var_name]
     if fallback_hermes_name and fallback_hermes_name in HERMES_ENV:
         return HERMES_ENV[fallback_hermes_name]
+    if var_name == "REFLEX_GATEWAY_TOKEN":
+        return _read_gateway_token_file()
     return ""
 
 def get_opencode_go_key() -> str:
@@ -66,6 +80,21 @@ CONFIG: Dict[str, Any] = {
         "max_cooldown_seconds": 300.0,
         "jitter_seconds": 5.0,
         "canary_lease_seconds": 60.0,
+    },
+    # CLI harness options (federation.py). default_model None => harness's own default.
+    "harnesses": {
+        "agy": {
+            "default_model": None,
+            "skip_permissions": True,   # print mode has no approver; set False for text-only delegation
+            "max_timeout_sec": 180.0,   # agy cold start (MCP/plugin load) can exceed 40s
+        },
+        "muse": {
+            "default_model": None,
+            "models": ["muse-spark-1.3"],  # Muse has no `models` command; config-declared catalog
+            "approval_mode": "on-request",  # Muse default; sandbox stays ON
+            "allow_yolo": False,  # SECURITY: opt-in only; --yolo disables approval AND sandbox
+            "max_timeout_sec": 120.0,
+        },
     },
     "providers": {
         "opencode-go": {

@@ -8,7 +8,9 @@ from config import CONFIG
 from classifier import classify_request, detect_tool_errors
 from circuit_breaker import BreakerState
 from server import app, estimate_tokens, get_session_id, select_candidate_routes, normalize_error
+from auth import verify_gateway_token
 
+app.dependency_overrides[verify_gateway_token] = lambda: None
 client = TestClient(app)
 
 def test_health_endpoint():

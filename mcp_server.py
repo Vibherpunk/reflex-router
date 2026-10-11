@@ -33,6 +33,18 @@ logger.addHandler(file_handler)
 logger.addHandler(stderr_handler)
 
 ROUTER_BASE_URL = os.environ.get("REFLEX_ROUTER_URL", "http://127.0.0.1:8787")
+
+
+def _gateway_headers(extra: dict | None = None) -> dict:
+    """Bearer auth for the Reflex gateway. Merges with (never replaces) caller headers."""
+    from config import get_key
+    headers = dict(extra or {})
+    # Same resolution as the gateway itself (env -> ~/.env -> ~/.hermes/.env):
+    # MCP clients rarely inherit the daemon's launchd environment.
+    token = get_key("REFLEX_GATEWAY_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 MAX_DELEGATION_DEPTH = 2
 MAX_INLINE_CHARS = 4000
 
@@ -73,12 +85,12 @@ def format_delegation_output(data: Dict[str, Any], delegation_id: str) -> str:
 
 @mcp.tool(
     name="reflex_delegate",
-    description="Delegate a coding task to an installed CLI agent harness (claude, opencode, goose, codex, agy) via Reflex."
+    description="Delegate a coding task to an installed CLI agent harness (claude, opencode, goose, codex, agy, muse) via Reflex."
 )
 async def reflex_delegate(
     task: Annotated[str, Field(description="Detailed task instructions and prompt for the delegated subagent.")],
     preferred_model: Annotated[str, Field(default="auto", description="Model name or capability (e.g. 'claude-3.7-sonnet', 'deepseek-v4-pro', 'auto').")] = "auto",
-    preferred_harness: Annotated[Optional[Literal["auto", "claude", "agy", "opencode", "goose", "codex"]], Field(default=None, description="Explicit harness override. Defaults to auto.")] = None,
+    preferred_harness: Annotated[Optional[Literal["auto", "claude", "agy", "opencode", "goose", "codex", "muse"]], Field(default=None, description="Explicit harness override. Defaults to auto.")] = None,
     cwd: Annotated[Optional[str], Field(default=None, description="Working directory for subagent execution. Must be an existing path.")] = None,
     timeout_sec: Annotated[float, Field(default=120.0, ge=5.0, le=600.0, description="Execution timeout in seconds (5-600).")] = 120.0
 ) -> str:
@@ -122,7 +134,7 @@ async def reflex_delegate(
     # Pure RPC execution via HTTP client
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_sec + 15.0, connect=5.0)) as client:
-            resp = await client.post(f"{ROUTER_BASE_URL}/v1/delegate", json=payload, headers=headers)
+            resp = await client.post(f"{ROUTER_BASE_URL}/v1/delegate", json=payload, headers=_gateway_headers(headers))
             if resp.status_code == 200:
                 data = resp.json()
                 return format_delegation_output(data, delegation_id)
@@ -157,7 +169,7 @@ async def reflex_status() -> str:
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
             health_res = await client.get(f"{ROUTER_BASE_URL}/health")
-            harnesses_res = await client.get(f"{ROUTER_BASE_URL}/v1/harnesses")
+            harnesses_res = await client.get(f"{ROUTER_BASE_URL}/v1/harnesses", headers=_gateway_headers())
             
             return json.dumps({
                 "status": "online",
@@ -182,7 +194,7 @@ async def reflex_route(
 ) -> str:
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-            res = await client.post(f"{ROUTER_BASE_URL}/v1/route", json={"prompt": prompt})
+            res = await client.post(f"{ROUTER_BASE_URL}/v1/route", json={"prompt": prompt}, headers=_gateway_headers())
             if res.status_code == 200:
                 return json.dumps(res.json(), indent=2)
             return json.dumps({"status": "error", "status_code": res.status_code, "error": res.text})

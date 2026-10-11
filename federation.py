@@ -1,6 +1,6 @@
 """
 Reflex CLI Harness Federation Engine (Plan B Hardened Implementation).
-Auto-discovers installed coding agent harnesses (agy, claude, opencode, goose, codex),
+Auto-discovers installed coding agent harnesses (agy, claude, opencode, goose, codex, muse),
 enforces headless non-interactive execution, isolates child process groups,
 and arbitrates cross-harness subagent delegation without raw API keys.
 """
@@ -104,8 +104,114 @@ HARNESS_SPECS = {
             "--json",
             "--dangerously-bypass-approvals-and-sandbox"
         ]
+    },
+    "muse": {
+        "name": "Muse Code",
+        "binary": "muse",
+        "subscription": "Muse Code (Meta)",
+        "models": [],  # populated from CONFIG["harnesses"]["muse"]["models"] (Muse has no list command)
+        "auth_files": [HOME / ".config/muse/auth.json"],
+        "accepts_options": True,
+        "cmd_builder": lambda bin_path, task, model=None, cwd=None: _build_muse_cmd(bin_path, task, model, cwd)
     }
 }
+
+def _harness_cfg(name: str) -> Dict[str, Any]:
+    """Per-harness options from config.CONFIG['harnesses'] (fail-soft: {} on any error)."""
+    try:
+        from config import CONFIG
+        return dict(CONFIG.get("harnesses", {}).get(name, {}))
+    except Exception:
+        return {}
+
+def _build_agy_cmd(bin_path: str, task: str, model: Optional[str] = None, cwd: Optional[str] = None) -> List[str]:
+    cfg = _harness_cfg("agy")
+    cmd = [bin_path, "-p", task, "--output-format", "json"]
+    # Print-mode has no interactive approver; without auto-approve, tool calls cannot run.
+    # Kept opt-out via config so operators can harden to text-only delegation.
+    if cfg.get("skip_permissions", True):
+        cmd.append("--dangerously-skip-permissions")
+    if cfg.get("print_timeout"):
+        cmd += ["--print-timeout", str(cfg["print_timeout"])]
+    chosen = model or cfg.get("default_model")
+    if chosen:
+        cmd += ["--model", chosen]
+    return cmd
+
+def _build_muse_cmd(bin_path: str, task: str, model: Optional[str] = None, cwd: Optional[str] = None) -> List[str]:
+    """Muse headless: sandbox + approval stay ON (Muse defaults); tools rooted at cwd."""
+    cfg = _harness_cfg("muse")
+    cmd = [bin_path, "exec",
+           "--approval-mode", cfg.get("approval_mode", "on-request"),
+           "--user-input-auto-resolve",
+           "--no-session-log"]
+    if cwd:
+        cmd += ["--workspace", cwd]
+    chosen = model or cfg.get("default_model")
+    if chosen:
+        cmd += ["--model", chosen]
+    # SECURITY: --yolo disables approval AND sandbox and trusts the workspace. Opt-in only.
+    if cfg.get("allow_yolo", False) is True:
+        cmd.append("--yolo")
+    cmd += ["--", task]
+    return cmd
+
+HARNESS_SPECS["agy"]["accepts_options"] = True
+HARNESS_SPECS["agy"]["cmd_builder"] = _build_agy_cmd
+
+def list_cli_models(key: str, bin_path: Optional[str] = None, timeout: float = 15.0) -> List[Tuple[str, str]]:
+    """Live (id, display_name) list from a harness CLI. Fail-soft: [] on any error.
+
+    agy: `agy models` prints `<id>\\t<display name>` rows. muse: no list command,
+    so models are config-declared (CONFIG['harnesses']['muse']['models']).
+    """
+    if key == "agy":
+        bin_path = bin_path or find_binary("agy")
+        if not bin_path:
+            return []
+        try:
+            res = subprocess.run([bin_path, "models"], capture_output=True, text=True,
+                                 timeout=timeout, stdin=subprocess.DEVNULL,
+                                 env=build_delegation_env(current_harness="reflex-discovery"))
+            if res.returncode != 0:
+                return []
+            rows = []
+            for line in res.stdout.splitlines():
+                parts = line.strip().split("\t")
+                if len(parts) >= 2 and parts[0] and " " not in parts[0]:
+                    rows.append((parts[0].strip(), parts[1].strip()))
+            return rows
+        except Exception:
+            return []
+    return [(m, m) for m in harness_models(key)]
+
+def harness_models(key: str) -> List[str]:
+    """Static spec models, overridable via CONFIG['harnesses'][key]['models']."""
+    cfg_models = _harness_cfg(key).get("models")
+    if cfg_models:
+        return list(cfg_models)
+    return list(HARNESS_SPECS.get(key, {}).get("models", []))
+
+def build_harness_cmd(key: str, bin_path: str, task: str, model: Optional[str] = None, cwd: Optional[str] = None) -> List[str]:
+    """Builds the headless argv; only option-aware specs receive model/cwd."""
+    spec = HARNESS_SPECS[key]
+    if spec.get("accepts_options"):
+        return spec["cmd_builder"](bin_path, task, model=model, cwd=cwd)
+    return spec["cmd_builder"](bin_path, task)
+
+def _model_for_harness(key: str, h_info: Dict[str, Any], preferred_model: Optional[str]) -> Optional[str]:
+    """Return preferred_model only if this harness serves it (manifest or `<key>-cli` catalog)."""
+    if not preferred_model or preferred_model == "auto":
+        return None
+    if preferred_model in (h_info.get("models") or []):
+        return preferred_model
+    try:
+        from catalog import ModelCatalog
+        if ModelCatalog().get(f"{key}-cli", preferred_model):
+            return preferred_model
+    except Exception:
+        pass
+    return None
 
 def get_augmented_path() -> str:
     """Builds a comprehensive PATH string incorporating all user agent directories."""
@@ -169,8 +275,10 @@ def discover_harnesses(force_rescan: bool = False) -> Dict[str, Any]:
             "version": version_str,
             "authenticated": authenticated,
             "subscription": spec["subscription"],
-            "models": spec["models"]
+            "models": [m for m, _ in list_cli_models(key, bin_path)] if key == "agy" and authenticated else harness_models(key)
         }
+        if not manifest["harnesses"][key]["models"]:
+            manifest["harnesses"][key]["models"] = harness_models(key)
 
     os.makedirs(MANIFEST_FILE.parent, exist_ok=True)
     try:
@@ -216,6 +324,8 @@ def build_delegation_env(
     # Anti-loop guard: child agents must not re-invoke reflex delegation tool
     if new_depth >= MAX_DELEGATION_DEPTH:
         env["REFLEX_DISABLE_DELEGATION"] = "1"
+
+    env.pop("REFLEX_GATEWAY_TOKEN", None)
 
     return env
 
@@ -283,6 +393,10 @@ def select_harness_for_model(requested_model: str, manifest: Optional[Dict[str, 
         if "codex" in installed and installed["codex"]["authenticated"]:
             return "codex"
 
+    if "muse" in target:
+        if "muse" in installed and installed["muse"]["authenticated"]:
+            return "muse"
+
     # Default fallback: check if any harness declares the model
     for h_name, h_info in installed.items():
         if h_info["authenticated"] and any(target in m.lower() for m in h_info.get("models", [])):
@@ -297,7 +411,8 @@ HARNESS_FAILOVER_CHAINS = {
     "opencode": ["opencode", "goose", "agy"],
     "agy": ["agy", "opencode", "goose"],
     "goose": ["goose", "opencode", "claude"],
-    "codex": ["codex", "opencode", "goose"]
+    "codex": ["codex", "opencode", "goose"],
+    "muse": ["muse", "opencode", "goose"]
 }
 
 def get_circuit_breaker() -> Dict[str, Any]:
@@ -479,10 +594,16 @@ async def call_reflex_http_gateway(task: str, preferred_model: str = "auto", tim
     }
     t0 = time.time()
     try:
+        _gw_headers = {"Content-Type": "application/json"}
+        # Same resolution as the gateway itself (env -> ~/.env -> ~/.hermes/.env).
+        from config import get_key as _gw_get_key
+        _gw_token = _gw_get_key("REFLEX_GATEWAY_TOKEN")
+        if _gw_token:
+            _gw_headers["Authorization"] = f"Bearer {_gw_token}"
         req = urllib.request.Request(
             gateway_url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"}
+            headers=_gw_headers
         )
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -592,8 +713,11 @@ async def delegate_subagent(
             continue
 
         h_info = installed[h_name]
-        spec = HARNESS_SPECS[h_name]
-        cmd = spec["cmd_builder"](h_info["binary_path"], task)
+        cmd = build_harness_cmd(
+            h_name, h_info["binary_path"], task,
+            model=_model_for_harness(h_name, h_info, preferred_model),
+            cwd=workdir
+        )
         env = build_delegation_env(os.environ, current_harness=h_name, depth=depth, chain=chain)
 
         # 1. Snapshot Git state before execution
@@ -605,7 +729,7 @@ async def delegate_subagent(
                 cmd=cmd,
                 cwd=workdir,
                 env=env,
-                timeout_sec=min(timeout_sec, 60.0)
+                timeout_sec=min(timeout_sec, float(_harness_cfg(h_name).get("max_timeout_sec", 60.0)))
             )
             h_duration_ms = int((time.time() - h_start) * 1000)
 

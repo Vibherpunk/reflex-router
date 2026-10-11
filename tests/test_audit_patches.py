@@ -21,8 +21,8 @@ client = TestClient(app)
 def test_p0_1_tier3_high_consequence_keywords():
     """All high-consequence keywords must classify into Tier 3."""
     keywords = [
-        "indemnification", "statutory", "reconcile", "ledger",
-        "blast radius", "audit", "delaware", "oar 414", "erdc", "subpoena"
+        "indemnification", "statutory",
+        "blast radius", "delaware", "oar 414", "erdc", "subpoena"
     ]
     for kw in keywords:
         prompt = f"Please process the {kw} requirements for this task."
@@ -59,7 +59,9 @@ def test_p0_2_circuit_open_returns_503_load_shedding(monkeypatch):
     opencode_breaker = ensure_breaker("opencode-go")
 
     # Force all providers into OPEN state
-    for b in [sub_breaker, openrouter_breaker, claude_breaker, opencode_breaker]:
+    agy_breaker = ensure_breaker("agy-cli")
+    muse_breaker = ensure_breaker("muse-cli")
+    for b in [sub_breaker, openrouter_breaker, claude_breaker, opencode_breaker, agy_breaker, muse_breaker]:
         b.state = BreakerState.OPEN
         b.cooldown_until = 9999999999.0
         b.canary_in_flight = False

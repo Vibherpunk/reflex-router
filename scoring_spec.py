@@ -137,6 +137,28 @@ def get_memory_escalation_defaults(tier: int) -> Dict[str, float]:
     return {k: float(v) for k, v in data.items()}
 
 
+_spec_hash_cache = {"mtime": 0.0, "hash": ""}
+
+
+def get_spec_hash() -> str:
+    """SHA-256 of the effective scoring spec (repo base + ~/.reflex user overlay).
+
+    Recomputed when either file's mtime changes, mirroring load_scoring_spec's
+    cache invalidation. Logged with every routing decision so the exact
+    thresholds behind a decision are recoverable.
+    """
+    import hashlib
+    repo_mtime = os.path.getmtime(REPO_SPEC_FILE) if REPO_SPEC_FILE.exists() else 0.0
+    user_mtime = os.path.getmtime(USER_SPEC_FILE) if USER_SPEC_FILE.exists() else 0.0
+    max_mtime = max(repo_mtime, user_mtime)
+    if not _spec_hash_cache["hash"] or _spec_hash_cache["mtime"] != max_mtime:
+        spec = load_scoring_spec()
+        blob = yaml.safe_dump(spec, sort_keys=True).encode("utf-8")
+        _spec_hash_cache["hash"] = hashlib.sha256(blob).hexdigest()
+        _spec_hash_cache["mtime"] = max_mtime
+    return _spec_hash_cache["hash"]
+
+
 def get_classification_param(param_name: str, fallback: Any) -> Any:
     return load_scoring_spec().get("classification", {}).get(param_name, fallback)
 
